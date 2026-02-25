@@ -12,8 +12,8 @@ Per AIP-1, the Flink integration data path is:
 ```
 Flink RowData → Arrow (Writer) → C Data Interface / JNI → Rust/DataFusion → Arrow → Flink RowData (Reader)
                   ^^^^^^^^^^^^                                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-                  #1850 (x-tong)                                                #1851 (this issue)
-```
+                     #1850                                                        #1851 (this issue)
+```  
 
 The writer side (#1850, PR #1930) converts Flink `RowData` into Arrow `VectorSchemaRoot` for export to the native engine. This issue implements the reverse: converting Arrow vectors returned by the native engine back into Flink `RowData` so downstream Flink operators can process the results.
 
