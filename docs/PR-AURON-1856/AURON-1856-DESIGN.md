@@ -3,51 +3,71 @@
 **Issue**: https://github.com/apache/auron/issues/1856
 **AIP**: AIP-1 — Introduce Flink integration of native engine
 **Author**: @weiqingy
-**Status**: Draft (Rev 2 — incorporating reviewer feedback)
+**Status**: Draft (Rev 3 — expression-level architecture per reviewer feedback)
+
+## Revision History
+
+| Rev | Date | Summary |
+|-----|------|---------|
+| 1 | 2026-03-18 | Initial design: ExecNode-level converter with constructor-injected factory |
+| 2 | 2026-03-21 | Singleton factory, input schema in context, `PhysicalPlanNode` return type (per reviewer Q1-Q3) |
+| 3 | 2026-03-30 | **Architecture shift**: expression-level converters (RexNode/AggregateCall), sub-interfaces, `PhysicalExprNode` return type (per reviewer March 23 + March 24 feedback) |
 
 ## 1. Motivation
 
-Per AIP-1, the Flink integration requires a **planner-side framework** that converts Flink physical plan nodes (`ExecNode` tree) into Auron's native execution plan (`PhysicalPlanNode` protobuf) for Rust/DataFusion execution. The data exchange layer is now in place:
+Per AIP-1, the Flink integration requires a **planner-side framework** that converts Flink physical plan nodes (`ExecNode` tree) into Auron's native execution plan for Rust/DataFusion execution. The data exchange layer is now in place:
 
 ```
-Flink RowData → Arrow (Writer #1850) → Native Engine → Arrow → Flink RowData (Reader #1851 DONE)
+Flink RowData -> Arrow (Writer #1850) -> Native Engine -> Arrow -> Flink RowData (Reader #1851 DONE)
 ```
 
-What's missing is the **conversion infrastructure** — the machinery that decides *which* Flink nodes can be converted and *how* to translate them into native plan representations. This is analogous to Spark's `AuronConverters` + `NativeConverters` pattern and Gluten's `RexNodeConverter` + `RexCallConverterFactory` pattern.
+What's missing is the **conversion infrastructure** — the machinery that decides *which* Flink expressions and aggregates can be converted and *how* to translate them into native plan representations. This is analogous to Spark's `NativeConverters.convertExpr()` pattern and Gluten's `RexNodeConverter` + `RexCallConverterFactory` pattern.
 
-This issue delivers three foundational classes:
+### Why Expression-Level (Rev 3 Architecture Shift)
+
+The Rev 2 design centered on `ExecNode`-level conversion (`FlinkNodeConverter` converts `ExecNode` -> `PhysicalPlanNode`). Based on reviewer feedback (March 23), this is **too abstract** for two reasons:
+
+1. **ExecNode encompasses too many concepts** — converting at that level requires internal cross-references within the converter, mixing expression conversion with plan assembly.
+2. **RexNode-level converters maximize reusability** — `RexLiteral` and `RexInputRef` converters can be shared across Calc, Agg, and future operators. It's hard to unify Calc and Agg at the ExecNode level.
+
+The top-level `PhysicalPlanNode` assembly (e.g., building a `ProjectionExecNode` from converted expressions) happens **outside** the expression converters — in the future rewritten `StreamExecCalc` or `ExecNodeGraphProcessor`.
+
+This issue now delivers **five foundational classes**:
 
 | Class | Role |
 |-------|------|
-| `FlinkNodeConverter` | Interface defining the contract for converting a Flink ExecNode to a native `PhysicalPlanNode` |
-| `FlinkNodeConverterFactory` | Singleton registry that holds converters and dispatches to the right one |
+| `FlinkNodeConverter<T>` | Base interface defining the generic convert contract |
+| `FlinkRexNodeConverter` | Sub-interface: converts Flink `RexNode` -> native `PhysicalExprNode` |
+| `FlinkAggCallConverter` | Sub-interface: converts Flink `AggregateCall` -> native `PhysicalExprNode` |
+| `FlinkNodeConverterFactory` | Singleton registry that dispatches by input type (RexNode vs AggregateCall) |
 | `ConverterContext` | Holds shared state (configuration, input schema, classloader) needed during conversion |
 
-These classes are **framework only** — no actual converter implementations (e.g., Calc converter) are included. Subsequent issues will implement converters that plug into this framework.
+These classes are **framework only** — no actual converter implementations (e.g., `RexCallConverter`, `RexLiteralConverter`) are included. Subsequent issues will implement converters that plug into this framework.
 
 ## 2. Design Approach
 
 ### Two Candidate Approaches
 
-**Approach A — Singleton factory with typed converter dispatch (recommended)**
+**Approach A — Expression-level converters with typed sub-interfaces (recommended)**
 
-A singleton factory holds a static registry of converters keyed by ExecNode class. Each converter translates a specific ExecNode type into Auron's `PhysicalPlanNode` protobuf. A `ConverterContext` carries the input schema and configuration needed for type-aware conversion.
+A generic base interface `FlinkNodeConverter<T>` defines the conversion contract. Two sub-interfaces specialize it for `RexNode` and `AggregateCall`. A singleton factory holds separate registries for each input type and dispatches by class hierarchy.
 
 This draws on best practices from:
-- **Gluten** (`RexCallConverterFactory` + `RexNodeConverter`): singleton factory, `isSuitable()` + `toTypedExpr()` pattern, `RexConversionContext` with input attribute names
-- **Spark Auron** (`AuronConverters` + `NativeConverters`): dispatch by plan type, expression → protobuf conversion, fail-safe try-convert semantics
+- **Gluten** (`RexCallConverterFactory` + `RexCallConverter`): singleton factory, `isSuitable()` + `toTypedExpr()` pattern, expression-level granularity
+- **Spark Auron** (`NativeConverters.convertExpr()` + `convertAggregateExpr()`): expression -> `PhysicalExprNode` conversion, aggregate -> `PhysicalExprNode` (wrapping `PhysicalAggExprNode`)
 
-**Approach B — Visitor-based tree rewriting**
+**Approach B — ExecNode-level converter (Rev 2 design)**
 
-Implement `AbstractExecNodeExactlyOnceVisitor` and use Flink's visitor pattern to walk the entire ExecNodeGraph, converting nodes inline.
+A single converter interface converts `ExecNode` -> `PhysicalPlanNode`, with expression conversion handled internally.
 
-- Tightly coupled to Flink's visitor API
-- Conversion logic mixed with traversal logic
-- Harder to test individual converters in isolation
+**Rejected because** (reviewer March 23 feedback):
+- ExecNode is too abstract — mixes plan assembly with expression conversion
+- Hard to unify Calc and Agg at the ExecNode level
+- Cannot reuse expression converters across operators
 
 ### Decision: Approach A
 
-The converter framework should be independent of how the graph is traversed. The future `ExecNodeGraphProcessor` that wires the framework into Flink's planner pipeline will handle traversal. The three classes in this PR focus on the **per-node conversion contract and dispatch**.
+Expression-level converters are more modular, more testable, and maximize code reuse across operator types. The plan-level assembly is a separate concern for the future `ExecNodeGraphProcessor`.
 
 ## 3. Detailed Design
 
@@ -58,82 +78,144 @@ All classes in `auron-flink-planner`, matching the planner module's role:
 ```
 auron-flink-extension/auron-flink-planner/src/main/java/
   org/apache/auron/flink/table/planner/converter/
-  ├── FlinkNodeConverter.java         (interface)
-  ├── FlinkNodeConverterFactory.java  (singleton registry + dispatch)
-  └── ConverterContext.java           (shared conversion state)
+  ├── FlinkNodeConverter.java            (base interface, generic)
+  ├── FlinkRexNodeConverter.java         (sub-interface for RexNode)
+  ├── FlinkAggCallConverter.java         (sub-interface for AggregateCall)
+  ├── FlinkNodeConverterFactory.java     (singleton registry + dispatch)
+  └── ConverterContext.java              (shared conversion state)
 ```
 
-### 3.2 FlinkNodeConverter (Interface)
+### 3.2 FlinkNodeConverter (Base Interface)
 
 ```java
 package org.apache.auron.flink.table.planner.converter;
 
-import org.apache.auron.protobuf.PhysicalPlanNode;
-import org.apache.flink.table.planner.plan.nodes.exec.ExecNode;
+import org.apache.auron.protobuf.PhysicalExprNode;
 
 /**
- * Defines the contract for converting a Flink {@link ExecNode} to an Auron
- * native {@link PhysicalPlanNode}.
+ * Base interface for converting Flink plan elements to Auron native
+ * {@link PhysicalExprNode} representations.
  *
- * <p>Each implementation handles a specific ExecNode type (e.g., StreamExecCalc).
- * The converter checks whether a given node can be natively executed and, if so,
- * produces the equivalent native plan representation.
+ * <p>This interface is parameterized by the input type to support different
+ * categories of plan elements. Two sub-interfaces are provided:
+ * <ul>
+ *   <li>{@link FlinkRexNodeConverter} for Calcite {@code RexNode} expressions
+ *   <li>{@link FlinkAggCallConverter} for Calcite {@code AggregateCall} aggregates
+ * </ul>
  *
- * <p>Implementations may need to convert not only the ExecNode itself but also
- * its internal expressions (e.g., RexNode projections, AggregateCall). The
- * {@link ConverterContext} provides the input schema needed for type-aware
- * expression conversion.
+ * @param <T> the type of plan element this converter handles
  */
-public interface FlinkNodeConverter {
+public interface FlinkNodeConverter<T> {
 
     /**
-     * Returns the ExecNode class this converter handles.
+     * Returns the concrete class this converter handles.
      * Used by {@link FlinkNodeConverterFactory} for lookup dispatch.
      */
-    Class<? extends ExecNode<?>> getExecNodeClass();
+    Class<? extends T> getNodeClass();
 
     /**
-     * Checks whether the given node can be converted to native execution.
+     * Checks whether the given element can be converted to native execution.
      *
-     * <p>A converter may decline based on unsupported types, expressions,
-     * or configuration. For example, a Calc converter may check whether all
-     * projection expressions involve supported data types by inspecting the
-     * input schema from the context. This method must not modify the node.
+     * <p>A converter may decline based on unsupported types, operand
+     * combinations, or configuration. This method must not have side effects.
      */
-    boolean isSupported(ExecNode<?> node, ConverterContext context);
+    boolean isSupported(T node, ConverterContext context);
 
     /**
-     * Converts the given node to a native {@link PhysicalPlanNode}.
+     * Converts the given element to a native {@link PhysicalExprNode}.
      *
-     * <p>The returned protobuf represents the equivalent computation in
-     * Auron's native engine. For nodes with expressions (e.g., Calc with
-     * projections/conditions, Agg with AggregateCalls), the converter is
-     * responsible for translating those expressions into the corresponding
-     * native representation within the PhysicalPlanNode.
-     *
-     * @throws IllegalArgumentException if the node type does not match
-     *         {@link #getExecNodeClass()}
+     * @throws IllegalArgumentException if the element type does not match
+     *         {@link #getNodeClass()}
      */
-    PhysicalPlanNode convert(ExecNode<?> node, ConverterContext context);
+    PhysicalExprNode convert(T node, ConverterContext context);
 }
 ```
 
 **Design rationale**:
 
-- **`getExecNodeClass()`** — Enables the factory to build a type-based lookup map. Each converter is registered for one ExecNode class. This is analogous to Spark's pattern-match dispatch in `AuronConverters.convertSparkPlan()` and Gluten's operator-name-keyed map in `RexCallConverterFactory`.
+- **Generic type parameter `<T>`** — Enables type-safe sub-interfaces without casts. `FlinkRexNodeConverter` works with `RexNode`; `FlinkAggCallConverter` works with `AggregateCall`. This follows the reviewer's suggestion of a base class with typed sub-interfaces.
 
-- **`isSupported(node, context)`** — Separated from `convert()` so the caller can check feasibility without side effects. Takes `ConverterContext` because support decisions depend on the **input schema** (are the input types supported for native execution?) and **configuration flags** (is this operator enabled?). This mirrors Gluten's `RexCallConverter.isSuitable(RexCall, context)`.
+- **Returns `PhysicalExprNode`** — Both RexNode expressions and AggregateCall aggregates map to `PhysicalExprNode` in the protobuf. In `auron.proto`, `PhysicalExprNode` is a oneof containing both scalar expression types (literal, column, binary op, cast, etc.) and `PhysicalAggExprNode`. This matches Spark's `NativeConverters.convertExpr()` (returns `PhysicalExprNode`) and `convertAggregateExpr()` (also returns `PhysicalExprNode` wrapping `PhysicalAggExprNode`).
 
-- **`convert(node, context)` returns `PhysicalPlanNode`** — The converter produces Auron's native plan protobuf, not a replacement Flink ExecNode. This is the key design decision informed by reviewer feedback and POC experience:
-  - The real work is translating Flink plan semantics → native plan semantics
-  - The native plan is what gets sent to the Rust engine via JNI
-  - A future Auron-specific ExecNode wrapper (which holds the PhysicalPlanNode and executes it) is a separate concern handled by the graph processor
-  - This matches Spark's pattern where `NativeProjectBase` builds `ProjectionExecNode` → `PhysicalPlanNode` protobuf internally
-  - It also matches Gluten's pattern where `RexNodeConverter.toTypedExpr()` returns the native expression type directly
+- **`getNodeClass()`** — Enables the factory to build type-based lookup maps. Analogous to Gluten's operator-name-keyed map in `RexCallConverterFactory`.
 
-- **Expression conversion is the converter's responsibility** — A Calc converter must translate `List<RexNode> projection` and `RexNode condition` into native expressions within the `PhysicalPlanNode`. An Agg converter must translate `AggregateCall` instances. This is not limited to ExecNode-level conversion — the converter handles whatever internal structures the node contains.
+- **`isSupported(node, context)`** — Separated from `convert()` so the caller can check feasibility without side effects. Takes `ConverterContext` because support decisions depend on the **input schema** (are the operand types supported?) and **configuration flags**. Mirrors Gluten's `RexCallConverter.isSuitable(RexCall, context)`.
 
-### 3.3 ConverterContext
+### 3.3 FlinkRexNodeConverter (Sub-Interface)
+
+```java
+package org.apache.auron.flink.table.planner.converter;
+
+import org.apache.calcite.rex.RexNode;
+
+/**
+ * Converts a Calcite {@link RexNode} expression to an Auron native
+ * {@link org.apache.auron.protobuf.PhysicalExprNode}.
+ *
+ * <p>Implementations handle specific RexNode subtypes:
+ * <ul>
+ *   <li>{@code RexLiteral} -> scalar literal values
+ *   <li>{@code RexInputRef} -> column references (resolved via
+ *       {@link ConverterContext#getInputType()})
+ *   <li>{@code RexCall} -> function/operator calls (arithmetic, comparison,
+ *       CAST, etc.)
+ *   <li>{@code RexFieldAccess} -> nested field access
+ * </ul>
+ *
+ * <p>RexNode converters are reusable across operator types — the same
+ * {@code RexInputRef} converter works for Calc projections, Agg grouping
+ * expressions, and future operators.
+ */
+public interface FlinkRexNodeConverter extends FlinkNodeConverter<RexNode> {
+}
+```
+
+**Design rationale**:
+
+- **Extends `FlinkNodeConverter<RexNode>`** — Inherits the generic contract with `RexNode` as the input type. No additional methods needed at this point; the sub-interface serves as a type marker for the factory's `rexConverterMap`.
+
+- **Reusability is the key motivation** — As the reviewer noted, `RexLiteral` and `RexInputRef` converters are needed by Calc (projections, conditions), Agg (grouping expressions), and future operators. Operating at the RexNode level means one converter implementation serves all operators. This matches Gluten's `RexNodeConverter` design.
+
+- **Future concrete implementations** (not in this PR) would include:
+  - `FlinkRexLiteralConverter` — `RexLiteral` -> `ScalarValue`
+  - `FlinkRexInputRefConverter` — `RexInputRef` -> `PhysicalColumn` (using `ConverterContext.getInputType()`)
+  - `FlinkRexCallConverter` — `RexCall` -> function-specific conversion (arithmetic, CAST, comparison, etc.)
+
+### 3.4 FlinkAggCallConverter (Sub-Interface)
+
+```java
+package org.apache.auron.flink.table.planner.converter;
+
+import org.apache.calcite.rel.core.AggregateCall;
+
+/**
+ * Converts a Calcite {@link AggregateCall} to an Auron native
+ * {@link org.apache.auron.protobuf.PhysicalExprNode} (wrapping a
+ * {@code PhysicalAggExprNode}).
+ *
+ * <p>An {@code AggregateCall} represents an aggregate function invocation
+ * (e.g., SUM, COUNT, MAX) with its argument references, return type, and
+ * distinctness. The converter translates this into a
+ * {@code PhysicalAggExprNode} containing the aggregate function type,
+ * converted child expressions, and return type.
+ *
+ * <p>Note: AggregateCall internally references input columns by index.
+ * The converter uses {@link ConverterContext#getInputType()} to resolve
+ * these indices to concrete types for type checking and cast insertion.
+ */
+public interface FlinkAggCallConverter extends FlinkNodeConverter<AggregateCall> {
+}
+```
+
+**Design rationale**:
+
+- **Extends `FlinkNodeConverter<AggregateCall>`** — Separate from `FlinkRexNodeConverter` because `AggregateCall` is not a `RexNode`. Flink/Calcite's `AggregateCall` contains `SqlAggFunction`, argument indices, return type, and distinctness — structurally different from `RexNode` subtypes.
+
+- **Returns `PhysicalExprNode`** — In `auron.proto`, `PhysicalAggExprNode` is a variant within `PhysicalExprNode.agg_expr`. Spark's `NativeConverters.convertAggregateExpr()` follows the same pattern: builds `PhysicalAggExprNode` -> wraps in `PhysicalExprNode`. This keeps the return type uniform across all converter sub-interfaces.
+
+- **Reuses RexNode converters** — An `AggregateCall` references `RexLiteral` and `RexInputRef` for its arguments. Future concrete implementations of this interface will delegate to the registered `FlinkRexNodeConverter` implementations for argument conversion, maximizing reuse.
+
+### 3.5 ConverterContext
 
 ```java
 package org.apache.auron.flink.table.planner.converter;
@@ -147,7 +229,7 @@ import org.apache.flink.table.types.logical.RowType;
  * during conversion.
  *
  * <p>Carries the input schema, configuration, and classloader needed for
- * type-aware conversion of Flink plan nodes and their expressions.
+ * type-aware conversion of Flink expressions and aggregate calls.
  */
 public class ConverterContext {
 
@@ -176,27 +258,16 @@ public class ConverterContext {
 }
 ```
 
-**Design rationale**:
-
-The context carries four things converters need:
+**Unchanged from Rev 2.** See Rev 2 design for full rationale.
 
 | Field | Source | Why converters need it |
 |-------|--------|----------------------|
-| `RowType inputType` | From the ExecNode's input edge output type | Resolve `RexInputRef` column references to names/types; check type support; determine if casts are needed (e.g., math on incompatible types). Inspired by Gluten's `RexConversionContext.getInputAttributeNames()` but richer — `RowType` carries both names and `LogicalType`s. |
+| `RowType inputType` | From the ExecNode's input edge output type | Resolve `RexInputRef` column references to names/types; check type support; determine if casts are needed |
 | `ReadableConfig tableConfig` | `PlannerBase.getTableConfig()` | Needed by `ExecNodeContext.newPersistedConfig()` when creating nodes |
 | `AuronConfiguration auronConfiguration` | `AuronAdaptor.getInstance().getAuronConfiguration()` | Auron-specific settings (enable flags, batch size, etc.) |
 | `ClassLoader classLoader` | `PlannerBase.getFlinkContext().getClassLoader()` | Needed by Flink's code generation and service loading |
 
-**Why `RowType inputType`?** When converting expressions within a Calc node, the converter needs to know what types the input columns have. For example:
-- `RexInputRef($0)` → need to know that column 0 is `INTEGER` to produce the right `PhysicalExprNode`
-- A math expression `$0 + $1` → need to check both operand types are numeric
-- Type mismatch → need to insert a cast in the native plan
-
-This was identified as a critical gap in the original design by the reviewer based on POC experience.
-
-**Why not hold `PlannerBase` directly?** The Flink `PlannerBase` is a heavyweight object tied to Flink's internal Calcite integration. Extracting only what converters need keeps the framework testable and decoupled.
-
-### 3.4 FlinkNodeConverterFactory
+### 3.6 FlinkNodeConverterFactory (Singleton)
 
 ```java
 package org.apache.auron.flink.table.planner.converter;
@@ -205,33 +276,45 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.Optional;
 
-import org.apache.auron.protobuf.PhysicalPlanNode;
-import org.apache.flink.table.planner.plan.nodes.exec.ExecNode;
+import org.apache.auron.protobuf.PhysicalExprNode;
+import org.apache.calcite.rex.RexNode;
+import org.apache.calcite.rel.core.AggregateCall;
 
 /**
  * Singleton registry of {@link FlinkNodeConverter} instances. Dispatches
- * conversion requests to the appropriate converter based on the ExecNode's
- * concrete class.
+ * conversion requests to the appropriate converter based on the input
+ * element's class.
  *
- * <p>Converters are registered via {@link #register(FlinkNodeConverter)}.
- * The singleton pattern ensures a single consistent registry across the
- * application, following the Gluten community's RexCallConverterFactory
- * pattern.
+ * <p>Maintains separate registries for different converter categories:
+ * <ul>
+ *   <li>{@code rexConverterMap} for {@link FlinkRexNodeConverter} instances
+ *       (keyed by {@code RexNode} subclass)
+ *   <li>{@code aggConverterMap} for {@link FlinkAggCallConverter} instances
+ *       (keyed by {@code AggregateCall} class)
+ * </ul>
+ *
+ * <p>This design follows the reviewer's proposal and Gluten's
+ * {@code RexCallConverterFactory} pattern.
  *
  * <p>Usage:
  * <pre>
  *   FlinkNodeConverterFactory factory = FlinkNodeConverterFactory.getInstance();
- *   Optional&lt;PhysicalPlanNode&gt; result = factory.convertNode(node, context);
+ *   // Convert a RexNode expression
+ *   Optional&lt;PhysicalExprNode&gt; result = factory.convertRexNode(rexNode, context);
+ *   // Convert an AggregateCall
+ *   Optional&lt;PhysicalExprNode&gt; aggResult = factory.convertAggCall(aggCall, context);
  * </pre>
  */
 public class FlinkNodeConverterFactory {
 
     private static final FlinkNodeConverterFactory INSTANCE = new FlinkNodeConverterFactory();
 
-    private final Map<Class<? extends ExecNode<?>>, FlinkNodeConverter> converterMap;
+    private final Map<Class<? extends RexNode>, FlinkRexNodeConverter> rexConverterMap;
+    private final Map<Class<? extends AggregateCall>, FlinkAggCallConverter> aggConverterMap;
 
     private FlinkNodeConverterFactory() {
-        this.converterMap = new HashMap<>();
+        this.rexConverterMap = new HashMap<>();
+        this.aggConverterMap = new HashMap<>();
     }
 
     /** Returns the singleton instance. */
@@ -240,34 +323,44 @@ public class FlinkNodeConverterFactory {
     }
 
     /**
-     * Registers a converter for its declared ExecNode class.
+     * Registers a RexNode converter for its declared RexNode subclass.
      *
      * @throws IllegalArgumentException if a converter is already registered
-     *         for the same ExecNode class
+     *         for the same RexNode class
      */
-    public void register(FlinkNodeConverter converter) {
-        Class<? extends ExecNode<?>> nodeClass = converter.getExecNodeClass();
-        FlinkNodeConverter existing = converterMap.put(nodeClass, converter);
-        if (existing != null) {
-            converterMap.put(nodeClass, existing); // restore
+    public void registerRexConverter(FlinkRexNodeConverter converter) {
+        Class<? extends RexNode> nodeClass = converter.getNodeClass();
+        if (rexConverterMap.containsKey(nodeClass)) {
             throw new IllegalArgumentException(
-                    "Duplicate converter for " + nodeClass.getName());
+                    "Duplicate RexNode converter for " + nodeClass.getName());
         }
+        rexConverterMap.put(nodeClass, converter);
     }
 
     /**
-     * Attempts to convert the given node to a native PhysicalPlanNode.
+     * Registers an AggregateCall converter.
      *
-     * <p>Returns the native plan if a matching converter exists and
-     * supports the node. Returns empty if:
-     * <ul>
-     *   <li>No converter is registered for the node's class</li>
-     *   <li>The converter's {@code isSupported} returns false</li>
-     *   <li>The converter throws an exception during conversion</li>
-     * </ul>
+     * @throws IllegalArgumentException if a converter is already registered
+     *         for the same AggregateCall class
      */
-    public Optional<PhysicalPlanNode> convertNode(ExecNode<?> node, ConverterContext context) {
-        FlinkNodeConverter converter = converterMap.get(node.getClass());
+    public void registerAggConverter(FlinkAggCallConverter converter) {
+        Class<? extends AggregateCall> nodeClass = converter.getNodeClass();
+        if (aggConverterMap.containsKey(nodeClass)) {
+            throw new IllegalArgumentException(
+                    "Duplicate AggregateCall converter for " + nodeClass.getName());
+        }
+        aggConverterMap.put(nodeClass, converter);
+    }
+
+    /**
+     * Attempts to convert the given RexNode to a native PhysicalExprNode.
+     *
+     * <p>Returns the native expression if a matching converter exists and
+     * supports the node. Returns empty if no converter, not supported, or
+     * conversion fails (fail-safe).
+     */
+    public Optional<PhysicalExprNode> convertRexNode(RexNode node, ConverterContext context) {
+        FlinkRexNodeConverter converter = rexConverterMap.get(node.getClass());
         if (converter == null) {
             return Optional.empty();
         }
@@ -283,106 +376,145 @@ public class FlinkNodeConverterFactory {
     }
 
     /**
-     * Returns the converter registered for the given node's class, if any.
+     * Attempts to convert the given AggregateCall to a native PhysicalExprNode.
      */
-    public Optional<FlinkNodeConverter> getConverter(ExecNode<?> node) {
-        return Optional.ofNullable(converterMap.get(node.getClass()));
+    public Optional<PhysicalExprNode> convertAggCall(
+            AggregateCall aggCall, ConverterContext context) {
+        FlinkAggCallConverter converter = aggConverterMap.get(aggCall.getClass());
+        if (converter == null) {
+            return Optional.empty();
+        }
+        if (!converter.isSupported(aggCall, context)) {
+            return Optional.empty();
+        }
+        try {
+            return Optional.of(converter.convert(aggCall, context));
+        } catch (Exception e) {
+            // Log warning, return empty (fail-safe)
+            return Optional.empty();
+        }
+    }
+
+    /**
+     * Returns the converter registered for the given element's class, if any.
+     * Dispatches by type hierarchy: checks RexNode first, then AggregateCall.
+     */
+    public Optional<FlinkNodeConverter<?>> getConverter(Class<?> nodeClass) {
+        if (RexNode.class.isAssignableFrom(nodeClass)) {
+            return Optional.ofNullable(rexConverterMap.get(nodeClass));
+        } else if (AggregateCall.class.isAssignableFrom(nodeClass)) {
+            return Optional.ofNullable(aggConverterMap.get(nodeClass));
+        }
+        return Optional.empty();
     }
 }
 ```
 
 **Design rationale**:
 
-- **Singleton** — Following Gluten's `RexCallConverterFactory` pattern. Converter registrations are compile-time constants, so a single global registry is natural. The future graph processor simply calls `FlinkNodeConverterFactory.getInstance()`. For testing, the singleton can be accessed and populated with test converters.
+- **Separate maps** — `rexConverterMap` and `aggConverterMap` provide type-safe storage. This follows the reviewer's proposed code structure (March 23 comment) where the factory dispatches by `RexNode.class.isAssignableFrom()` vs `AggregateCall.class.isAssignableFrom()`.
 
-- **`register()` method** — Converters register themselves, rather than being passed as a list. This enables future converters (added in separate issues/PRs) to register in their own static initializers or via a startup hook without modifying the factory.
+- **Typed registration and conversion methods** — `registerRexConverter()` / `convertRexNode()` and `registerAggConverter()` / `convertAggCall()` provide type-safe APIs without casts. Callers know exactly what they're registering and converting.
 
-- **`convertNode()` returns `Optional<PhysicalPlanNode>`** — Returns `Optional.empty()` when conversion is not possible (no converter, not supported, or failure). This is cleaner than returning the original ExecNode — the caller knows unambiguously whether conversion succeeded and can decide what to do (e.g., keep the original Flink node for JVM execution).
+- **`getConverter(Class<?>)`** — General-purpose lookup that dispatches by type hierarchy, matching the reviewer's code snippet. Returns `Optional<FlinkNodeConverter<?>>` (wildcard generic) for flexibility.
 
-- **Fail-safe** — If a converter throws during `convert()`, the exception is logged and `Optional.empty()` is returned. This prevents a buggy converter from breaking the entire query. Same pattern as Spark's `tryConvert()`.
+- **Singleton, fail-safe, duplicate detection** — Unchanged from Rev 2. See Rev 2 design for full rationale.
 
-- **Exact-class lookup** — Uses `node.getClass()` as the map key. A converter registered for `StreamExecCalc` will not match `BatchExecCalc` even though both extend `CommonExecCalc`. This is intentional: stream and batch nodes may have different semantics, and converters should be explicit.
+- **Extensible** — As the reviewer noted, "we could also explore ways to expand this further." Future categories (e.g., `RexFieldAccess`, sort expressions) can be added with new maps and registration methods without modifying existing converters.
 
 ## 4. Interaction Diagram
 
-How these three classes fit into the future end-to-end flow:
+How these five classes fit into the future end-to-end flow:
 
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│  Future ExecNodeGraphProcessor (NOT in this PR)                  │
-│                                                                  │
-│  1. Receives ExecNodeGraph from PlannerBase                      │
-│  2. Walks graph via ExecNodeVisitor                              │
-│  3. For each node:                                               │
-│     a. Build ConverterContext (with node's input RowType)        │
-│     b. factory.convertNode(node, context)                        │
-│     c. If present: wrap PhysicalPlanNode in AuronExecNode        │
-│     d. Reconnect input edges to replacement node                 │
-│  4. Returns modified ExecNodeGraph                               │
-└──────────────────────────────────────────────────────────────────┘
-        │ uses                │ uses               │ uses
-        ▼                     ▼                    ▼
-┌──────────────┐   ┌──────────────────┐   ┌─────────────────────┐
-│ConverterCtx  │   │ConverterFactory  │   │ FlinkNodeConverter  │
-│              │   │   (singleton)    │   │    (interface)      │
-│ inputType    │   │                  │   │                     │
-│ tableConfig  │   │ getInstance()   │   │ getExecNodeClass()  │
-│ auronConfig  │   │ register()      │   │ isSupported()       │
-│ classLoader  │   │ convertNode()  │──▶│ convert()           │
-│              │   │ getConverter()  │   │  → PhysicalPlanNode │
-└──────────────┘   └──────────────────┘   └─────────────────────┘
-                                                    △
-                                                    │ implements
-                                   ┌────────────────┼────────────────┐
-                                   │                │                │
-                            ┌──────┴─────┐  ┌──────┴─────┐  ┌──────┴─────┐
-                            │ CalcConv   │  │ AggConv    │  │ FilterConv │
-                            │ (future)   │  │ (future)   │  │ (future)   │
-                            │            │  │            │  │            │
-                            │ Converts:  │  │ Converts:  │  │ Converts:  │
-                            │ RexNode    │  │ AggCall    │  │ RexNode    │
-                            │ projection │  │ groups     │  │ condition  │
-                            │ condition  │  │            │  │            │
-                            └────────────┘  └────────────┘  └────────────┘
+                      Future ExecNodeGraphProcessor (NOT in this PR)
+                     ┌─────────────────────────────────────────────────┐
+                     │ For each ExecNode in graph:                     │
+                     │  1. Build ConverterContext (input RowType)       │
+                     │  2. Extract expressions from node               │
+                     │     - Calc: List<RexNode> proj, RexNode cond    │
+                     │     - Agg: List<AggregateCall>, grouping exprs  │
+                     │  3. Convert each via factory:                    │
+                     │     factory.convertRexNode(rex, ctx)             │
+                     │     factory.convertAggCall(agg, ctx)             │
+                     │  4. Assemble PhysicalPlanNode from results       │
+                     │  5. Wrap in AuronExecNode, reconnect edges       │
+                     └──────────────┬──────────────────────────────────┘
+                                    │ uses
+                    ┌───────────────┼───────────────┐
+                    ▼               ▼               ▼
+          ┌──────────────┐  ┌─────────────────┐  ┌─────────────────────────┐
+          │ConverterCtx  │  │ConverterFactory │  │ FlinkNodeConverter<T>   │
+          │              │  │  (singleton)     │  │   (base interface)      │
+          │ inputType    │  │                  │  │                         │
+          │ tableConfig  │  │ convertRexNode() │  │ getNodeClass()          │
+          │ auronConfig  │  │ convertAggCall() │  │ isSupported(T, ctx)     │
+          │ classLoader  │  │ getConverter()   │  │ convert(T, ctx)         │
+          └──────────────┘  └─────────────────┘  │   -> PhysicalExprNode   │
+                                                  └────────────┬────────────┘
+                                                               │ extends
+                                              ┌────────────────┼────────────────┐
+                                              ▼                                 ▼
+                                ┌──────────────────────┐          ┌──────────────────────┐
+                                │ FlinkRexNodeConverter │          │ FlinkAggCallConverter  │
+                                │   <RexNode>           │          │   <AggregateCall>      │
+                                └──────────┬───────────┘          └──────────┬─────────────┘
+                                           │ implements (future)             │ implements (future)
+                              ┌────────────┼────────────┐                   │
+                              ▼            ▼            ▼                   ▼
+                        ┌──────────┐ ┌──────────┐ ┌──────────┐      ┌──────────────┐
+                        │RexLiteral│ │RexInput  │ │RexCall   │      │AggCall       │
+                        │Converter │ │RefConv.  │ │Converter │      │Converter     │
+                        │(future)  │ │(future)  │ │(future)  │      │(future)      │
+                        │          │ │          │ │          │      │              │
+                        │Shared by:│ │Shared by:│ │Shared by:│      │SUM,COUNT,MAX │
+                        │Calc, Agg,│ │Calc, Agg,│ │Calc, Agg,│      │AVG, etc.     │
+                        │Filter,...│ │Filter,...│ │Filter,...│      │              │
+                        └──────────┘ └──────────┘ └──────────┘      └──────────────┘
 ```
+
+**Key insight**: RexNode converters (left branch) are shared across operator types. A `RexInputRefConverter` registered once works for Calc projections, Agg grouping expressions, filter conditions, and any future operator. This is the reusability benefit of the expression-level architecture.
 
 ## 5. Prior Art Comparison
 
-| Aspect | Spark Auron | Gluten Flink | This PR |
-|--------|------------|-------------|---------|
-| Converter interface | `AuronConvertProvider` | `RexCallConverter` | `FlinkNodeConverter` |
-| Factory | `AuronConverters` (object) | `RexCallConverterFactory` (singleton) | `FlinkNodeConverterFactory` (singleton) |
-| Discovery | ServiceLoader | Static registration | `register()` method |
-| Context | Implicit static config | `RexConversionContext` (input attr names) | `ConverterContext` (input RowType + config) |
-| Input schema | Not in context (accessed via SparkPlan) | `inputAttributeNames: List<String>` | `inputType: RowType` (names + types) |
-| Return type | `SparkPlan` (replacement node) | `TypedExpr` (Velox native expr) | `PhysicalPlanNode` (Auron native protobuf) |
-| Fail-safe | `tryConvert()` catches, falls back | Throws on unsupported | `Optional.empty()` on failure |
-| Scope | ExecNode-level only | Expression-level (RexNode) | ExecNode-level (expressions handled within converter) |
+| Aspect | Spark Auron | Gluten Flink | This PR (Rev 3) |
+|--------|------------|-------------|-----------------|
+| Converter interface | N/A (direct `convertExpr` function) | `RexCallConverter` | `FlinkNodeConverter<T>` (base) + `FlinkRexNodeConverter` + `FlinkAggCallConverter` |
+| Factory | N/A (single `NativeConverters` object) | `RexCallConverterFactory` (singleton) | `FlinkNodeConverterFactory` (singleton, multi-map) |
+| Granularity | Expression-level (`convertExpr`, `convertAggregateExpr`) | Expression-level (`RexNode`, `RexCall`) | Expression-level (`RexNode`, `AggregateCall`) |
+| Discovery | N/A (hardcoded pattern match) | Static registration | `registerRexConverter()` / `registerAggConverter()` |
+| Context | Implicit (accessed via SparkPlan) | `RexConversionContext` (input attr names) | `ConverterContext` (input RowType + config) |
+| Input schema | Not in context | `inputAttributeNames: List<String>` | `inputType: RowType` (names + types) |
+| Return type | `PhysicalExprNode` | `TypedExpr` (Velox native) | `PhysicalExprNode` |
+| Agg handling | `convertAggregateExpr()` -> `PhysicalExprNode` | `AggregateCallConverter` (separate) | `FlinkAggCallConverter` -> `PhysicalExprNode` |
+| Fail-safe | Throws `NotImplementedError` | Throws on unsupported | `Optional.empty()` on failure |
 
-**Key design choices informed by prior art**:
-- **Singleton factory** — from Gluten's pattern, simpler than constructor injection
-- **Input schema in context** — from Gluten's `RexConversionContext`, essential for type-aware expression conversion (reviewer's POC experience confirmed this)
-- **Return `PhysicalPlanNode`** — from reviewer's POC experience; the real output is the native plan protobuf, matching Spark's internal pattern where native plan nodes build `PhysicalPlanNode` protobuf
-- **`Optional` return** — improvement over both Spark (returns original node) and Gluten (throws); caller knows unambiguously whether conversion succeeded
+**Key alignment with prior art**:
+- **Expression-level granularity** — matches both Spark (`convertExpr`) and Gluten (`RexNodeConverter`)
+- **`PhysicalExprNode` return type** — matches Spark's `NativeConverters.convertExpr()` and `convertAggregateExpr()` (both return `PhysicalExprNode`). Confirmed by reviewer (March 24).
+- **Agg as `PhysicalExprNode`** — In `auron.proto`, `PhysicalAggExprNode` is a variant within `PhysicalExprNode.agg_expr`. Spark builds `PhysicalAggExprNode` -> wraps in `PhysicalExprNode`. Same pattern here.
+- **Singleton factory with separate maps** — matches reviewer's proposed code structure and Gluten's `RexCallConverterFactory`
 
 ## 6. Dependencies
 
 ### Build Dependencies (already in auron-flink-planner pom.xml)
 
-- `auron-flink-runtime` — provides `AuronConfiguration`, `PhysicalPlanNode` (protobuf)
-- `flink-table-planner` — provides `ExecNode`, `ExecNodeBase`
+- `auron-flink-runtime` — provides `AuronConfiguration`, `PhysicalExprNode` (protobuf)
+- `flink-table-planner` — provides `ExecNode`, `ExecNodeBase`, and transitively Calcite's `RexNode`, `AggregateCall`
 - `flink-table-runtime` — provides `RowData`, `ReadableConfig`
+- `flink-table-calcite-bridge` — Calcite bridge (already declared)
 - JUnit Jupiter — test scope
 
 ### New Dependencies: None
 
 ### Code Dependencies
 
-- `org.apache.flink.table.planner.plan.nodes.exec.ExecNode` — core interface for plan nodes
+- `org.apache.calcite.rex.RexNode` — Calcite expression base class
+- `org.apache.calcite.rel.core.AggregateCall` — Calcite aggregate call
 - `org.apache.flink.table.types.logical.RowType` — Flink's row type (input schema)
 - `org.apache.flink.configuration.ReadableConfig` — Flink configuration interface
 - `org.apache.auron.configuration.AuronConfiguration` — Auron configuration base class
-- `org.apache.auron.protobuf.PhysicalPlanNode` — Auron's native plan protobuf
+- `org.apache.auron.protobuf.PhysicalExprNode` — Auron's native expression protobuf
 
 ## 7. Test Plan
 
@@ -390,13 +522,16 @@ How these three classes fit into the future end-to-end flow:
 
 | Test | What It Validates |
 |------|-------------------|
-| `testEmptyFactory` | Factory with no converters returns empty for any input |
-| `testConverterDispatch` | Registered mock converter is called for matching node type |
-| `testUnsupportedNodePassthrough` | Converter's `isSupported` returns false → empty returned |
-| `testConversionFailureFallback` | Converter throws → empty returned (fail-safe) |
-| `testDuplicateConverterRejected` | Two converters for same class → `IllegalArgumentException` |
-| `testGetConverterPresent` | `getConverter` returns the registered converter |
-| `testGetConverterAbsent` | `getConverter` returns empty for unregistered node type |
+| `testEmptyFactoryRexNode` | Factory with no converters returns empty for any RexNode |
+| `testEmptyFactoryAggCall` | Factory with no converters returns empty for any AggregateCall |
+| `testRexConverterDispatch` | Registered mock RexNode converter is called for matching RexNode type |
+| `testAggConverterDispatch` | Registered mock AggCall converter is called for matching AggregateCall type |
+| `testUnsupportedRexPassthrough` | RexNode converter's `isSupported` returns false -> empty returned |
+| `testConversionFailureFallback` | Converter throws -> empty returned (fail-safe) |
+| `testDuplicateRexConverterRejected` | Two converters for same RexNode class -> `IllegalArgumentException` |
+| `testDuplicateAggConverterRejected` | Two converters for same AggregateCall class -> `IllegalArgumentException` |
+| `testGetConverterByClass` | `getConverter(RexLiteral.class)` returns registered RexNode converter |
+| `testGetConverterAbsent` | `getConverter` returns empty for unregistered class |
 
 ### 7.2 ConverterContextTest
 
@@ -417,65 +552,56 @@ How these three classes fit into the future end-to-end flow:
 
 ## 8. Alternatives Considered
 
-### 8.1 Return `ExecNode<?>` instead of `PhysicalPlanNode`
+### 8.1 ExecNode-level converter (Rev 2 design)
 
-Have converters return a replacement Flink ExecNode rather than a native protobuf.
+`FlinkNodeConverter.convert(ExecNode<?>) -> PhysicalPlanNode`
 
-**Rejected because** (based on reviewer's POC experience):
-- The real work is translating Flink semantics → native plan semantics
-- The PhysicalPlanNode protobuf is what gets sent to Rust via JNI
-- Creating a wrapper ExecNode (that holds the PhysicalPlanNode for execution) is a separate concern for the graph processor
-- Matches Spark's internal pattern where native plan nodes produce PhysicalPlanNode protobuf
+**Rejected** (reviewer March 23):
+- ExecNode is too abstract — requires internal cross-references within converters
+- Hard to unify Calc and Agg at the ExecNode level
+- Cannot reuse expression converters across operators
+- See Section 2 for details
 
-### 8.2 Visitor-based tree rewriter
+### 8.2 Non-generic sub-interfaces (no base interface)
 
-Combine traversal and conversion into a single `AbstractExecNodeExactlyOnceVisitor` subclass.
-
-**Rejected because**:
-- Mixes traversal logic with conversion logic
-- Hard to test converters in isolation
-- The traversal strategy is a separate concern (future `ExecNodeGraphProcessor`)
-
-### 8.3 Holding PlannerBase in ConverterContext
-
-Pass the full `PlannerBase` object to converters.
+Two independent interfaces (`FlinkRexNodeConverter`, `FlinkAggCallConverter`) without a shared base.
 
 **Rejected because**:
-- Makes converters untestable without full Flink planner setup
-- Exposes far more API surface than needed
-- Couples to Flink's internal planner class (not a stable public API)
+- Loses the ability to express the common contract (`getNodeClass`, `isSupported`, `convert`)
+- The reviewer explicitly proposed "FlinkNodeConverter is the base class" with sub-interfaces
+- The factory's `getConverter(Class<?>)` needs a common return type
 
-### 8.4 Constructor-injected factory (original design v1)
+### 8.3 Single unified map in factory
 
-Pass converters as a `List` to the factory constructor.
+One `Map<Class<?>, FlinkNodeConverter<?>>` instead of separate `rexConverterMap` and `aggConverterMap`.
 
-**Revised to singleton** based on reviewer feedback and Gluten's pattern:
-- Converter registrations are compile-time constants
-- Singleton is simpler to use — no need to thread a factory instance through the call chain
-- New converters in separate PRs can register themselves without modifying the factory setup code
+**Rejected because**:
+- Loses type safety — `FlinkRexNodeConverter` and `FlinkAggCallConverter` would be mixed
+- The reviewer's code snippet explicitly shows separate maps: `rexConverterMap.get(node)` vs `aggConverterMap.get(node.getClass())`
+- Separate maps enable typed registration (`registerRexConverter` vs `registerAggConverter`)
 
-### 8.5 Context without input schema (original design v1)
+### 8.4 Visitor-based tree rewriter
 
-`ConverterContext` with only config and classloader.
+**Rejected** — unchanged from Rev 2. See Rev 2 Section 8.2.
 
-**Revised to include `RowType inputType`** based on reviewer's POC experience:
-- Expression conversion requires knowing input column types
-- Type mismatches need cast insertion in the native plan
-- `RexInputRef` resolution requires the input schema
-- Matches Gluten's `RexConversionContext.getInputAttributeNames()` but richer (types + names)
+### 8.5 Holding PlannerBase in ConverterContext
+
+**Rejected** — unchanged from Rev 2. See Rev 2 Section 8.3.
 
 ## 9. Scope Boundaries
 
 ### In Scope
-- `FlinkNodeConverter` interface
-- `FlinkNodeConverterFactory` singleton class
+- `FlinkNodeConverter<T>` base interface
+- `FlinkRexNodeConverter` sub-interface
+- `FlinkAggCallConverter` sub-interface
+- `FlinkNodeConverterFactory` singleton class (with separate maps)
 - `ConverterContext` class (with input schema)
 - Unit tests for factory and context
 
 ### Out of Scope (follow-up issues)
 - `ExecNodeGraphProcessor` implementation (graph traversal + wiring)
-- Actual `FlinkNodeConverter` implementations (Calc, Agg, Filter, etc.)
-- Expression-level converter utilities (RexNode → PhysicalExprNode helpers)
+- Actual converter implementations (`RexLiteralConverter`, `RexInputRefConverter`, `RexCallConverter`, etc.)
+- Plan-level `PhysicalPlanNode` assembly (building `ProjectionExecNode` from converted expressions)
 - Flink configuration flags (e.g., `ENABLE_CALC`)
 - `FlinkMetricNode` class
 - Changes to existing runtime classes
