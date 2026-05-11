@@ -186,6 +186,33 @@ This concern is captured here so the #1853 author picks it up at the start of th
 
 ---
 
+## Alignment with AIP-1
+
+This design is a direct implementation of the **Phase One: Stateless Operator Support (Calc Operator)** track in AIP-1: Flink SQL + Auron Collaboration. Element-by-element alignment, with file-evidence anchors:
+
+| Element | AIP-1 reference | Actual code / our design | Status |
+|---|---|---|---|
+| `SupportsAuronNative` interface | `getPhysicalPlanNode()` (singular), `getAuronId()`, `getOutputType()` | Actual: `getPhysicalPlanNodes()` (**plural**), `getAuronOperatorId()`, `getOutputType()`, `getMetricNode()` — verified at `auron-flink-runtime/.../runtime/operator/SupportsAuronNative.java:27-48` | **Follow actual code.** Interface evolved post-AIP — plural form reserves space for fused multi-plan operators (#1865); `getMetricNode()` added when MetricGroup bridging was generalized. |
+| `FlinkAuronOperator` marker interface | Defined in AIP | Exists at `runtime/operator/FlinkAuronOperator.java` extending `SupportsAuronNative` (empty body) | ✓ Implement |
+| Plan tree: `Project[Filter[FFIReader]]` (Filter optional when no condition) | AIP `StreamExecCalc.translateToPlanInternal` snippet | Same shape | ✓ Aligned |
+| `FFIReaderExecNode.setSchema(nativeSchema)` | AIP snippet | Same — built from `SchemaConverters.convertToAuronSchema(inputRowType, false)` | ✓ Aligned |
+| `FFIReaderExecNode.setExportIterProviderResourceId(resourceId)` | AIP snippet | Same | ✓ Aligned |
+| **`FFIReaderExecNode.setNumPartitions(...)`** | **Not in AIP snippet** | **Set to `1`** (each Flink subtask = 1 native partition; aligns with DataFusion's `UnknownPartitioning(num_partitions)` at `ffi_reader_exec.rs:99`) | **Explicit refinement** (AIP omitted; left as proto default `0` would mis-shape native partitioning) |
+| Native invocation loop: `wrapper.loadNextBatch(batch -> { FlinkArrowReader.create(batch, rowType).read(i); collect(...); })` | AIP snippet (in `NativeKafkaSourceFunction` section) | Same pattern reused for Calc's drain loop | ✓ Aligned |
+| **Plan-build site (where `resourceId` is generated)** | **AIP shows generation inside `StreamExecCalc.translateToPlanInternal` (= rewriter)** | **Generated inside operator's `open()`** at runtime | **Justified deviation.** `translateToPlanInternal` runs once at job submission, before subtask info exists. `JniBridge.putResource` is a JVM-static `ConcurrentHashMap` — all subtasks of the same job would collide on a shared key. Per-subtask uniqueness requires runtime generation. **Operator does a runtime leaf-rewrite** on the constructor-supplied plan, replacing the placeholder `resourceId` in the `FFIReaderExecNode` leaf with one generated from `getOperatorUniqueID() + subtaskIndex + UUID`. The #1853 rewriter will build the rest of the plan (Project, Filter, FFIReader with placeholder) and pass it in. |
+| Operator-ID propagation | Not addressed in AIP for FFI Reader | Resource-ID prefix embeds Flink OperatorId per OQ1=(i) | Post-AIP refinement based on reviewer feedback (Design Review Round 1, 2026-05-10) |
+| `FlinkMetricNode` extracted class | Not in AIP (Kafka source uses inline anonymous subclass at `AuronKafkaSourceFunction.java:290-302`) | Extracted to `runtime/metric/FlinkMetricNode.java` for reuse | Post-AIP extension; mechanical refactor of the inline pattern, no semantic change |
+| Synchronous FFI exporter (OQ2) | Not addressed in AIP | Synchronous | Aligned with reviewer's "FFI is intermediate — no need to modify it" |
+| Base class `TableStreamOperator<RowData>` (OQ3) | Not specified in AIP | Chosen for Gluten parity + `chainingStrategy=ALWAYS` | Reviewer silently approved |
+| `RowData → Arrow` conversion | "Support RowData to Arrow" is Phase 1 line item | Uses #1850 `FlinkArrowWriter` (merged) | ✓ Aligned |
+| Expression converters (`+ - * /`, etc.) | "Support various operator expressions" is Phase 1 line item | Uses #1859 `FlinkNodeConverterFactory` (merged) | ✓ Aligned — used by #1853 rewriter, not by this operator |
+| Native Kafka connector | Phase 1 line item | #1847+ merged | ✓ Independent of #1857 |
+| Whole-stage native operator merging | Phase 1 line item | #1865 (future) | ✓ Out of scope for #1857 |
+
+**Summary**: this design is fully aligned with AIP-1's Phase 1 architecture and the existing in-repo patterns (Kafka source as the canonical precedent for native-runtime integration). The two explicit deviations — runtime resource-ID generation and `setNumPartitions(1)` — are justified by file-evidence correctness concerns the AIP snippet does not address, not by stylistic preference.
+
+---
+
 ## Detailed Design
 
 ### Three-layer placement
