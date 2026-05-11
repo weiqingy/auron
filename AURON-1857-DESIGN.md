@@ -1,8 +1,8 @@
 # Design — AURON-1857: Introduce `FlinkAuronCalcOperator`
 
 **Author**: weiqingy
-**Date**: 2026-04-28
-**Status**: Draft for community review
+**Date**: 2026-04-28 (initial) — Rev 2: 2026-05-10 (Design Review Round 1 resolved)
+**Status**: Approved overall in Design Review Round 1 (2026-05-10); OQ1 = (i), OQ2 = synchronous, OQ3 = `TableStreamOperator<RowData>`
 **Issue**: https://github.com/apache/auron/issues/1857
 **Depends on**: #1850 (`FlinkArrowWriter`, merged), #1851 (`FlinkArrowReader`, merged), #1859 (`RexNode → PhysicalExprNode` converters, PR #2167 merged 2026-04-17)
 **Unblocks**: #1853 (rewrite `StreamExecCalc`), #1865 (operator fusion)
@@ -108,49 +108,40 @@ The three sub-decisions below have proposed design solutions, each backed by fil
 
 ### OQ1 — Operator-ID propagation mechanism
 
-**Background**: The native side needs a stable operator identifier (for metric tags, log prefixes, and any future per-operator state channels). Without one, native logs and metrics for parallel subtasks become indistinguishable across job restarts. The question is **how** to thread that identifier from the JVM operator into the native plan, not whether. Three candidate mechanisms:
+**Background**: The native side needs a stable operator identifier (for metric tags, log prefixes, and any future per-operator state channels). Without one, native logs and metrics for parallel subtasks become indistinguishable across job restarts. The question is **how** to thread that identifier from the JVM operator into the native plan, not whether.
 
-| # | Mechanism | Where ID lives | Proto change? | Precedent |
-|---|---|---|---|---|
-| (i) | Bake operator ID into `FFIReaderExecNode.export_iter_provider_resource_id` prefix (e.g. `FlinkAuronCalc:<opId>:<subtask>:<uuid>`) | Inside the resource-ID string | None | None — Spark uses a pure UUID at `ConvertToNativeBase.scala:77`, no operator-ID propagation |
-| **★ (ii)** | **Add `string auron_operator_id = 4;` field to `FFIReaderExecNode`** | **First-class proto field on the boundary node** | **One-line addition** | **Direct — `KafkaScanExecNode.auron_operator_id = 6;` (`auron.proto:756`) follows exactly this pattern** |
-| (iii) | `JniBridge.putResource("<opIdKey>", value)` side channel | Side-channel keyed map; plan does NOT carry the ID | None | Partial — `AuronKafkaSourceFunction.java:238` uses operator ID as the key for runtime-info side channel, *in addition to* (ii) |
+**Resolution (2026-05-10, Design Review Round 1)**: **Embed the operator ID in the FFI Reader resource-ID prefix.** No proto change. `FFIReaderExecNode` stays unchanged.
 
-**Author preference: (ii)**
+**Concrete format** (built inside `FlinkAuronCalcOperator.open()`):
 
-Justification (file-evidence-backed):
+```java
+String flinkOpId = ((StreamingRuntimeContext) getRuntimeContext()).getOperatorUniqueID();
+int subtask = getRuntimeContext().getIndexOfThisSubtask();
+String resourceId = "FlinkAuronCalc-" + flinkOpId + "-" + subtask + ":" + UUID.randomUUID();
+JniBridge.putResource(resourceId, exporter);
+ffiReaderBuilder.setExportIterProviderResourceId(resourceId);
+// NO setAuronOperatorId(...) — FFIReaderExecNode is unchanged.
+```
 
-1. **Direct precedent in this repo**: `KafkaScanExecNode.auron_operator_id = 6;` (`auron.proto:756`) is the existing pattern — same proto type (`string`), same role (operator ID on the JVM↔native boundary node), same string format. Adding `auron_operator_id` to `FFIReaderExecNode` is a symmetrical extension that any reviewer familiar with the Kafka source will find immediately recognizable.
-2. **Native side gets a typed field, not a parsed string**: a typed `string auron_operator_id` is more maintainable than format conventions encoded in a resource-ID.
-3. **Resource ID stays semantically clean**: it remains "lookup key for the iter provider," nothing more. (i) overloads the resource ID with two concerns.
-4. **Spark precedent doesn't exist for this**: Spark's `ConvertToNativeBase.scala:77` uses a pure UUID — does NOT propagate operator ID. So we cannot mirror Spark for this concern; the Kafka source pattern is the only in-repo precedent.
+`SupportsAuronNative.getAuronOperatorId()` returns the unsuffixed `flinkOpId` (mirrors Kafka source's pattern of exposing the unsuffixed value via the interface).
 
-**Important — zero Rust logic edits required (Approach A within OQ1)**:
+**Why this format**:
 
-For Calc, `auron_operator_id` is **identity metadata**, not a JNI lookup key. The lookup key is already `export_iter_provider_resource_id`. Therefore:
+1. **Flink-Operator-granularity-aware**: a Calc operator is a single Flink Operator that contains multiple Auron ExecNodes (Project, Filter, FFIReader). Embedding `flinkOpId` at the front of the resource ID lets the native side recognize all ExecNodes within the same Flink Operator as related, and supports future suffix expansion if per-ExecNode distinction is needed.
+2. **FFI Reader stays an intermediate**: no proto change keeps the boundary node generic and shared with Spark's `ConvertToNativeBase`.
+3. **Native side has identity if it needs it**: the prefix is parseable as `FlinkAuronCalc-<flinkOpId>-<subtask>` if a future PR wants to extract it for logging or metrics.
+4. **No "No Rust changes" constraint relaxation needed**: the original constraint stands as-is.
 
-| Side | Edit required for OQ1=(ii)? |
-|---|---|
-| `auron.proto:728-732` | Yes — one line: `string auron_operator_id = 4;` |
-| Java protobuf bindings | Auto-regen via `protobuf-maven-plugin` (`dev/mvn-build-helper/proto/pom.xml:46-64`) |
-| Rust protobuf bindings | Auto-regen via `prost`/`tonic-build` (`auron-planner/build.rs:22,47`) |
-| `native-engine/datafusion-ext-plans/src/ffi_reader_exec.rs` | **No** — struct unchanged |
-| `native-engine/auron-planner/src/planner.rs:570-577` (deserializer) | **No** — does not need to read the new field |
-| `spark-extension/.../ConvertToNativeBase.scala:80-89` | **No** — compiles unchanged; runtime gets default empty string (harmless) |
+**Alternatives considered (rejected)**:
 
-This is a critical contrast with Kafka: `KafkaScanExecNode.auron_operator_id` IS a JNI lookup key (`kafka_scan_exec.rs:244, 394, 445`), so its addition required Rust struct + planner edits. For FFI Reader, the field is purely metadata — no Rust logic changes.
-
-**Constraint implication**: The author's working constraint for #1857 was originally "No Rust changes — this is JVM-side operator wiring only." If (ii) is approved, that constraint needs a small narrowing:
-
-> No Rust **logic** changes; proto schema additions allowed where required for operator-ID propagation, by symmetry with `KafkaScanExecNode`.
-
-**Decision request**: confirm (ii) with the constraint relaxation, or override toward (i) / (iii).
+- **(ii) Add `string auron_operator_id = 4;` to `FFIReaderExecNode`.** Initially the author's preference because it mirrors `KafkaScanExecNode.auron_operator_id = 6;`. **Rejected** because `auron_operator_id` was designed for Flink-Operator granularity (one Flink Operator = one ID), but a Calc operator has multiple Auron ExecNodes (Project, Filter, FFIReader) — adding a single field on `FFIReaderExecNode` doesn't naturally express that 1-to-N relationship, and the reviewer's PoC pattern already uses suffix expansion to handle it. Plus, the reviewer noted "FFI is an intermediate process — no need to make changes to it."
+- **(iii) Side-channel-only via `JniBridge.putResource("<opIdKey>", value)`.** Rejected: the plan itself would have no record of which operator owns it, making native logs harder to correlate. Useful as a *complement* for runtime-info push (the way Kafka source does it), but not a substitute for embedding identity in the plan.
 
 ### OQ2 — Synchronous vs. threaded FFI exporter
 
 **Background**: Spark's `ArrowFFIExporter.scala:69-173` uses a producer/consumer threading model with `BlockingQueue<QueueState>`. Should `FlinkArrowFFIExporter` mirror this, or run synchronously on the operator thread?
 
-**Author preference: synchronous** (no background thread).
+**Resolution (2026-05-10, Design Review Round 1)**: **Synchronous** (no background thread). Reviewer's "no need to make changes to FFI" is consistent.
 
 **Why** — full end-to-end thread trace, JVM through tokio:
 
@@ -167,11 +158,9 @@ This is a critical contrast with Kafka: `KafkaScanExecNode.auron_operator_id` IS
 
 **Cross-thread access between `processElement` (operator thread) and `exportNextBatch` (tokio blocking pool) is serialized by the synchronous wait** at step 3 — `processElement` cannot run while `loadNextBatch` is in flight (Flink runtime guarantee). No locking needed.
 
-**Decision request**: confirm synchronous, or override.
-
 ### OQ3 — Base class: `TableStreamOperator<RowData>` vs. `AbstractStreamOperator<RowData>`
 
-**Author preference: `TableStreamOperator<RowData>`**.
+**Resolution (2026-05-10, Design Review Round 1)**: **`TableStreamOperator<RowData>`**.
 
 **Why**:
 
@@ -180,7 +169,20 @@ This is a critical contrast with Kafka: `KafkaScanExecNode.auron_operator_id` IS
 3. **Gluten parity** — `GlutenOneInputOperator.java:53-54` extends `TableStreamOperator<OUT>` for the identical Calc-replacement use case. Aligning lowers cognitive load for reviewers familiar with Gluten.
 4. **No drawbacks observed** — unused added fields/methods (`currentWatermark`, `ContextImpl ctx`, `computeMemorySize`) are inert.
 
-**Decision request**: confirm `TableStreamOperator`, or override.
+---
+
+## Forward-Looking Note for #1853
+
+The reviewer (during Design Review Round 1) flagged a concern that does **not** affect #1857 but is **binding on the next PR**:
+
+> "Mainly you should consider, in the next PR, the `streamExecCalc` and integration issues with this operator."
+
+When `streamExecCalc` is rewritten in **#1853** to use `FlinkAuronCalcOperator`, the integration must be explicitly considered:
+- How the graph-rewriter substitutes Flink's codegen factory (`CodeGenOperatorFactory<RowData>`) with one that constructs `FlinkAuronCalcOperator`.
+- How the rewriter passes the right `PhysicalPlanNode` (Project[Filter[FFIReader-placeholder]]), input + output `RowType`, and operator ID into the constructor.
+- How operator chaining behavior (`ChainingStrategy.ALWAYS`, set automatically by `TableStreamOperator`) interacts with the rewriter's substitution timing.
+
+This concern is captured here so the #1853 author picks it up at the start of that PR.
 
 ---
 
@@ -272,7 +274,7 @@ public class FlinkAuronCalcOperator
         this.resourceId = "FlinkAuronCalc:" + opIdWithSubtask + ":" + UUID.randomUUID();
         JniBridge.putResource(resourceId, exporter);
 
-        // 4. Build runtime plan: inject resourceId (and OQ1=ii: auron_operator_id) into FFI Reader leaf
+        // 4. Build runtime plan: inject resourceId (containing operator-ID prefix per OQ1=(i)) into FFI Reader leaf
         this.runtimePlan = injectFfiReaderLeaf(plan, resourceId, opIdWithSubtask);
 
         // 5. Create native runtime
@@ -481,7 +483,7 @@ ProjectionExecNode {
       schema: <converted by SchemaConverters.convertToAuronSchema(inputRowType, false)>
       num_partitions: 1
       export_iter_provider_resource_id: "<placeholder>"   // replaced at runtime in open()
-      auron_operator_id: ""                                // [OQ1=ii] set at runtime in open()
+      // No auron_operator_id field — operator ID is embedded in the resource ID prefix (OQ1=(i))
     }
     expr: [<#1859 RexCallConverter output for filter>]
   }
@@ -499,7 +501,7 @@ The operator's `injectFfiReaderLeaf(plan, resourceId, opIdWithSubtask)` walks th
 |---|---|---|---|---|
 | Operator base class | `TableStreamOperator<RowData>` | N/A (Spark `SparkPlan`) | `TableStreamOperator<OUT>` | `RichParallelSourceFunction` |
 | JVM↔native input bridge | `FFIReaderExecNode` + `FlinkArrowFFIExporter` (sync) | `FFIReaderExecNode` + `ArrowFFIExporter` (threaded) | Velox `BlockingQueue` + `VectorInputBridge` | Direct (Kafka source IS the native source) |
-| Operator-ID propagation | **Proto field** (OQ1=ii) on `FFIReaderExecNode` | None (pure UUID) | None (atomic counter, no Flink OperatorID link) | Proto field on `KafkaScanExecNode` (precedent for OQ1=ii) |
+| Operator-ID propagation | **Resource-ID prefix** (OQ1=(i)): `FlinkAuronCalc-<flinkOpId>-<subtask>:<UUID>` | None (pure UUID) | None (atomic counter, no Flink OperatorID link) | Proto field on `KafkaScanExecNode` (different mechanism — Kafka uses it as a JNI lookup key, not just identity) |
 | Allocator scope | Child allocator per subtask under `FlinkArrowUtils.ROOT_ALLOCATOR` | Process-wide ROOT + child per FFI-export batch | Per-operator `RootAllocator(MAX_VALUE)` | Root allocator |
 | Drain on watermark | Yes (drain → forward) | N/A (Spark has no Flink watermarks) | Yes (forward to native task → drain) | N/A |
 | Drain on snapshot pre-barrier | Yes (`prepareSnapshotPreBarrier`) | N/A | TODO/stub (Gluten's checkpoint is a placeholder) | N/A (Kafka snapshots offsets, not in-flight rows) |
@@ -528,7 +530,7 @@ The operator's `injectFfiReaderLeaf(plan, resourceId, opIdWithSubtask)` walks th
 
 ### Conditional proto change (if OQ1 = ii)
 
-`native-engine/auron-planner/proto/auron.proto:732` — add `string auron_operator_id = 4;` to `FFIReaderExecNode`. Auto-regenerates Java + Rust bindings.
+**None.** OQ1 resolved as (i) — operator ID is embedded in the FFI Reader resource-ID string. `auron.proto`, `ffi_reader_exec.rs`, and `planner.rs` are unchanged.
 
 ### Cross-module dependency edge (verified Maven-enforced)
 
@@ -554,7 +556,7 @@ The operator's `injectFfiReaderLeaf(plan, resourceId, opIdWithSubtask)` walks th
 - `testProcessWatermark_flushesBeforeForward` — `processWatermark(mark)` drains in-flight batch THEN forwards watermark via `Output.emitWatermark`. Recording `Output<StreamRecord<RowData>>` asserts ordering.
 - `testPrepareSnapshotPreBarrier_flushesInFlight` — same drain semantics on the pre-barrier hook.
 - `testCloseIsIdempotentAndDrains` — `close()` drains residue + closes wrapper; second `close()` is a no-op.
-- `testAuronOperatorIdPropagation` — [if OQ1=ii] runtime `PhysicalPlanNode`'s `FFIReaderExecNode.auron_operator_id` is set to `getOperatorUniqueID() + "-" + subtaskIdx`.
+- `testResourceIdEmbedsFlinkOperatorIdAndSubtask` — runtime `PhysicalPlanNode`'s `FFIReaderExecNode.export_iter_provider_resource_id` follows the format `FlinkAuronCalc-<flinkOpId>-<subtask>:<UUID>`; verifies no proto field is set (the field doesn't exist).
 
 ### Tests deferred to #1853
 - Native end-to-end Calc execution (requires `libauron`).
@@ -572,7 +574,8 @@ The operator's `injectFfiReaderLeaf(plan, resourceId, opIdWithSubtask)` walks th
 | `RelNode → PhysicalPlanNode` for `Calc` | #1853 (graph-rewriter) | Plan-layer; depends on #1857 (this issue) but built separately |
 | `StreamExecCalc` substitution / graph rewriting | #1853 | Rewriter-layer; explicitly separated per the three-layer rule (see Problem Statement) |
 | Source-fused Calc (Scenario A) | #1865 | Requires native plan merging; out of MVP |
-| Native-side consumption of `auron_operator_id` (metric tags / log prefixes) | Follow-up PR | OQ1 Approach A is metadata-only; native logic edits deferred |
+| Native-side consumption of the operator-ID prefix (metric tags / log prefixes) | Follow-up PR | Native can parse `FlinkAuronCalc-<flinkOpId>-<subtask>:` from the resource ID if needed; richer plumbing deferred |
+| `streamExecCalc` integration with `FlinkAuronCalcOperator` | #1853 | Reviewer-flagged forward-looking concern (see §"Forward-Looking Note for #1853") |
 | `AuronKafkaSourceFunction` migration to extracted `FlinkMetricNode` | Follow-up PR | #1857 introduces the class and uses it; Kafka migration is mechanical refactor not blocking #1857 |
 | `OneInputStreamOperatorTestHarness` integration tests | #1853 | Deferred per reviewer heads-up #2 |
 
@@ -588,9 +591,9 @@ Rejected because `TableStreamOperator` provides `chainingStrategy = ALWAYS` for 
 
 Rejected because Flink's push-based `processElement` model has no IO-blocking iterator like Spark's RDD compute. Spark's threading is producer-side latency isolation, not deadlock avoidance. Synchronous design is safe per full thread trace; threading would add concurrency hazards without measurable benefit in MVP.
 
-### A3 — Operator-ID via resource-ID string prefix instead of proto field (OQ1=i)
+### A3 — `auron_operator_id` proto field on `FFIReaderExecNode` (OQ1=ii)
 
-Rejected because: (1) Spark precedent does NOT propagate operator ID through the resource ID string (pure UUID at `ConvertToNativeBase.scala:77`); the pattern doesn't exist in this repo. (2) Native side would need to parse the string, fragile to format drift. (3) The `KafkaScanExecNode.auron_operator_id` proto field is the only in-repo precedent — symmetrical extension to `FFIReaderExecNode` is more reviewable.
+Originally the author's preference; **rejected** in Design Review Round 1 (2026-05-10). The reviewer pointed out that `auron_operator_id` was designed for **Flink-Operator granularity** (one Flink Operator = one ID), but a Calc operator contains **multiple Auron ExecNodes** (Project, Filter, FFIReader); in the reviewer's PoC he used suffix expansions to handle the 1-to-N relationship, which doesn't fit a single proto field on `FFIReaderExecNode`. Reviewer also noted "FFI is an intermediate process — no need to make changes to it." The resource-ID-prefix approach (OQ1=(i)) replaced this as the chosen mechanism. See §"OQ1" for the full resolution.
 
 ### A4 — Operator-ID via `JniBridge.putResource` side-channel only (OQ1=iii)
 
@@ -610,10 +613,12 @@ Rejected per the three-layer rule (see Problem Statement) and the explicit roadm
 
 ---
 
-## Open Items Summary (for easy review)
+## Resolved Open Items Summary (Design Review Round 1, 2026-05-10)
 
-Three open design questions have proposed solutions detailed above in §"Design Solutions for the Open Questions" — including full evidence and preferred options. Repeated here as a quick index:
+Three open design questions resolved during Design Review Round 1 — full reasoning detailed above in §"Design Solutions for the Open Questions". Quick index:
 
-1. **OQ1** — Operator-ID propagation mechanism. Preferred: **(ii)** proto field on `FFIReaderExecNode`, mirrors `KafkaScanExecNode`; constraint narrows to "no Rust *logic* changes; proto schema additions allowed."
-2. **OQ2** — Synchronous vs. threaded `FlinkArrowFFIExporter`. Preferred: **synchronous** (no background thread), backed by the full thread-trace evidence in §OQ2.
-3. **OQ3** — Operator base class. Preferred: **`TableStreamOperator<RowData>`** (Gluten parity, `chainingStrategy=ALWAYS` for free, zero coupling cost).
+1. **OQ1** — Operator-ID propagation mechanism. **Resolved: (i)** — embed operator ID in the FFI Reader resource-ID prefix, format `FlinkAuronCalc-<flinkOpId>-<subtask>:<UUID>`. No proto change. (Initial preference (ii) rejected per reviewer feedback on Flink-Operator-vs-Auron-ExecNode granularity.)
+2. **OQ2** — Synchronous vs. threaded `FlinkArrowFFIExporter`. **Resolved: synchronous** (no background thread), backed by the full thread-trace evidence in §OQ2.
+3. **OQ3** — Operator base class. **Resolved: `TableStreamOperator<RowData>`** (Gluten parity, `chainingStrategy=ALWAYS` for free, zero coupling cost).
+
+Plus one forward-looking concern (not blocking #1857; binding on #1853): `streamExecCalc` integration with `FlinkAuronCalcOperator` — see §"Forward-Looking Note for #1853".
