@@ -1,11 +1,32 @@
 # Design — AURON-1853: Convert Flink `StreamExecCalc` to Native Calc
 
 **Author**: weiqingy
-**Date**: 2026-05-19
-**Status**: Rev 1 — pending reviewer feedback
+**Date**: 2026-05-19 (initial) — **Rev 2**: 2026-05-19 (simplified per reviewer feedback: drop factory + helper classes)
+**Status**: Rev 2 — pending reviewer feedback
 **Issue**: https://github.com/apache/auron/issues/1853
 **Depends on**: #1856 (converter framework, merged), #1859 (RexNode converters, merged), #1857 (FlinkAuronCalcOperator, PR #2263 merged 2026-05-18)
 **Unblocks**: #1860, #1861, #1862, #1863, #1864, #1865
+
+---
+
+## Rev 2 Changes (2026-05-19)
+
+Two simplifications in response to reviewer feedback on Rev 1:
+
+**Q1 (drop the factory)**: `FlinkAuronCalcOperatorFactory` removed. `OneInputTransformation` already accepts an `OneInputStreamOperator` directly (verified constructor `OneInputTransformation(Transformation, String, OneInputStreamOperator, TypeInformation, int)` in `flink-streaming-java-1.18.1.jar`), and Flink wraps it internally in `SimpleOperatorFactory`. Constructing `FlinkAuronCalcOperator` inline matches Gluten's pattern in `gluten-flink/.../stream/StreamExecCalc.java` (`new GlutenOneInputOperator(...)` passed directly to `ExecNodeUtil.createOneInputTransformation`). The custom factory was over-engineering.
+
+**Q2 (drop the bespoke helpers)**: `RexProgramToPlanBuilder` and `AuronCalcConversionResult` removed. The plan-build logic moves inline into the shadowed `StreamExecCalc.translateToPlanInternal`. The shared abstraction the design relies on is the converter framework (`FlinkNodeConverterFactory` + `FlinkRexNodeConverter`), which is already universal across operators (#1860/#1861/#1864/#1865 reuse it as-is). Fallback signal becomes `Optional<PhysicalPlanNode>` returned from a small private helper inside the shadowed class — no custom sum type.
+
+**Net result**:
+
+| | Rev 1 | Rev 2 |
+|---|---|---|
+| Files created | 5 (StreamExecCalc + factory + builder + result + tests) | **1** (StreamExecCalc) |
+| Files modified | 1 (`FlinkNodeConverterFactory` static initializer) + 1 (`FlinkAuronConfiguration` config option) | same (2) |
+| Test classes | 4 (factory + builder + StreamExecCalc + ITCase) | **2** (StreamExecCalc + ITCase) |
+| Lines of new code | ~600 | ~250 (estimate) |
+
+All Rev 1 architectural decisions preserved: JAR shadowing, plan shape `Project[Filter?[FFIReader-placeholder]]`, `FAIL_BACK_FLINK_ENGINE_ENABLED` config (default `true`), per-Calc `super.translateToPlanInternal` fallback, runtime resource-ID rewrite at operator's `open()`, identity from `ExecNode.getId()`.
 
 ---
 
@@ -25,7 +46,7 @@ Three candidates were considered. The trade-off is between **invasiveness** (how
 
 Ship a class at FQCN `org.apache.flink.table.planner.plan.nodes.exec.stream.StreamExecCalc` inside `auron-flink-planner`. Java's classloader resolves a single class per FQCN; whichever JAR sits first on the classpath wins. With `auron-flink-planner` placed ahead of `flink-table-planner` (the normal case for Auron-enabled Flink deployments), Flink's planner constructs Auron's shadowed class whenever it builds a Calc ExecNode.
 
-The shadowed class extends `CommonExecCalc` (Flink's parent, in `org.apache.flink.table.planner.plan.nodes.exec.common`), keeps Flink's two public constructors and `@ExecNodeMetadata(name="stream-exec-calc", version=1, minPlanVersion=v1_15, minStateVersion=v1_15)` annotation byte-for-byte, and overrides `translateToPlanInternal(PlannerBase, ExecNodeConfig)`. The override builds the Auron `PhysicalPlanNode` via #1859's converters; on success it returns a `OneInputTransformation` wired to `FlinkAuronCalcOperatorFactory`; on **any** failure (unsupported RexNode, conversion exception, schema mismatch) it delegates to `super.translateToPlanInternal(planner, config)`, which produces Flink's stock codegen operator unchanged.
+The shadowed class extends `CommonExecCalc` (Flink's parent, in `org.apache.flink.table.planner.plan.nodes.exec.common`), keeps Flink's two public constructors and `@ExecNodeMetadata(name="stream-exec-calc", version=1, minPlanVersion=v1_15, minStateVersion=v1_15)` annotation byte-for-byte, and overrides `translateToPlanInternal(PlannerBase, ExecNodeConfig)`. The override builds the Auron `PhysicalPlanNode` inline via #1859's converter framework; on success it constructs a `FlinkAuronCalcOperator` and returns a `OneInputTransformation` wrapping it; on **any** failure (unsupported RexNode, conversion exception, schema mismatch) it delegates to `super.translateToPlanInternal(planner, config)` per the `FAIL_BACK_FLINK_ENGINE_ENABLED` config, which produces Flink's stock codegen operator unchanged.
 
 **Pros**:
 - Matches the issue text literally ("rewrite the Flink `StreamExecCalc` class").
@@ -43,7 +64,7 @@ The shadowed class extends `CommonExecCalc` (Flink's parent, in `org.apache.flin
 
 ### Approach B — Custom `PlannerFactory` SPI + subclassed `StreamPlanner` — REJECTED
 
-Register an `AuronPlannerFactory` via `META-INF/services/org.apache.flink.table.factories.Factory` returning an `AuronStreamPlanner extends StreamPlanner` that overrides `getExecNodeGraphProcessors()` to return `super.getExecNodeGraphProcessors() :+ new AuronCalcRewriteProcessor()`. The processor walks the `ExecNodeGraph`, finds `StreamExecCalc` instances, and substitutes a custom ExecNode that returns a Transformation with `FlinkAuronCalcOperatorFactory`.
+Register an `AuronPlannerFactory` via `META-INF/services/org.apache.flink.table.factories.Factory` returning an `AuronStreamPlanner extends StreamPlanner` that overrides `getExecNodeGraphProcessors()` to return `super.getExecNodeGraphProcessors() :+ new AuronCalcRewriteProcessor()`. The processor walks the `ExecNodeGraph`, finds `StreamExecCalc` instances, and substitutes a custom ExecNode that returns a Transformation wired to a substituted operator.
 
 **Why rejected**:
 - `getExecNodeGraphProcessors()` returns `scala.collection.Seq<...>` from a hardcoded method body inside `StreamPlanner` (verified via `javap` on `flink-table-planner_2.12-1.18.1.jar`). It is overridable, but only via subclassing the planner.
@@ -89,7 +110,7 @@ The compromises (namespace pollution, classpath ordering, signature-stability de
 │  Override: translateToPlanInternal(PlannerBase, ExecNodeConfig)       │
 │      1. Try to build PhysicalPlanNode via converters                  │
 │      2. On success: return OneInputTransformation wired to            │
-│                    FlinkAuronCalcOperatorFactory                      │
+│                    constructed FlinkAuronCalcOperator                 │
 │      3. On any failure: super.translateToPlanInternal(...)            │
 └─────────┬─────────────────────────────────────┬───────────────────────┘
           │ calls                                │ calls
@@ -103,39 +124,33 @@ The compromises (namespace pollution, classpath ordering, signature-stability de
 
 ### Class layout
 
-Five new files, all in `auron-flink-planner`:
+**One** new file in `auron-flink-planner`:
 
 ```
 auron-flink-planner/src/main/java/
 └── org/apache/flink/table/planner/plan/nodes/exec/stream/
-    └── StreamExecCalc.java         (shadowed — same FQCN as Flink's)
-
-└── org/apache/auron/flink/table/planner/processor/
-    ├── FlinkAuronCalcOperatorFactory.java      (StreamOperatorFactory<RowData> impl)
-    ├── RexProgramToPlanBuilder.java            (pure helper: RexNodes → PhysicalPlanNode)
-    └── AuronCalcConversionResult.java          (sum type: Success(plan) | Fallback(reason))
+    └── StreamExecCalc.java         (shadowed — same FQCN as Flink's; inline plan build + fallback)
 ```
 
-One file modified in `auron-flink-planner`:
+**Two** files modified:
 ```
-└── org/apache/auron/flink/table/planner/converter/
-    └── FlinkNodeConverterFactory.java          (add static initializer registering the 3 built-in converters)
+auron-flink-planner/src/main/java/org/apache/auron/flink/table/planner/converter/
+└── FlinkNodeConverterFactory.java          (add static initializer registering the 3 built-in converters)
+
+auron-flink-extension/auron-flink-runtime/src/main/java/org/apache/auron/flink/configuration/
+└── FlinkAuronConfiguration.java            (add FAIL_BACK_FLINK_ENGINE_ENABLED config option)
 ```
 
 Tests:
 ```
-auron-flink-planner/src/test/java/
-├── org/apache/flink/table/planner/plan/nodes/exec/stream/
-│   └── StreamExecCalcTest.java                  (verifies shadowing + override behavior)
-└── org/apache/auron/flink/table/planner/processor/
-    ├── FlinkAuronCalcOperatorFactoryTest.java   (serialization + createStreamOperator)
-    └── RexProgramToPlanBuilderTest.java         (plan-shape variants + fallback)
+auron-flink-planner/src/test/java/org/apache/flink/table/planner/plan/nodes/exec/stream/
+└── StreamExecCalcTest.java                  (shadowing verification + plan-build paths + fallback config)
 
 auron-flink-planner/src/test/java/.../runtime/
-└── AuronCalcRewriteITCase.java                  (E2E SQL: TestValuesTableFactory → Calc → Sink)
+└── AuronCalcRewriteITCase.java              (E2E SQL: TestValuesTableFactory → Calc → Sink)
 ```
 
-### File 1 — Shadowed `StreamExecCalc`
+### File 1 — Shadowed `StreamExecCalc` (all logic inline)
 
 ```java
 // org.apache.flink.table.planner.plan.nodes.exec.stream.StreamExecCalc
@@ -187,226 +202,119 @@ public class StreamExecCalc extends CommonExecCalc
     }
 
     @Override
+    @SuppressWarnings("unchecked")
     protected Transformation<RowData> translateToPlanInternal(
             PlannerBase planner, ExecNodeConfig config) {
         Transformation<RowData> upstream =
                 (Transformation<RowData>) getInputEdges().get(0).translate(planner);
         RowType inputRowType = (RowType) getInputEdges().get(0).getOutputType();
+        RowType outputRowType = (RowType) getOutputType();
 
-        AuronCalcConversionResult result =
-                tryConvert(projection, condition, inputRowType, (RowType) getOutputType(),
-                        planner, getPersistedConfig());
+        Optional<PhysicalPlanNode> plan = tryBuildAuronPlan(inputRowType, outputRowType);
 
-        if (!result.isSuccess()) {
-            LOG.debug("Falling back to Flink's CodeGen Calc for node {}: {}",
-                    getId(), result.getFallbackReason());
-            return super.translateToPlanInternal(planner, config);
+        if (!plan.isPresent()) {
+            boolean fallbackEnabled = AuronAdaptor.getInstance()
+                    .getAuronConfiguration()
+                    .get(FlinkAuronConfiguration.FAIL_BACK_FLINK_ENGINE_ENABLED);
+            if (fallbackEnabled) {
+                LOG.debug("Falling back to Flink's CodeGen Calc for node {}", getId());
+                return super.translateToPlanInternal(planner, config);
+            }
+            throw new IllegalStateException(
+                    "Auron Calc conversion failed for node " + getId()
+                    + " and fallback is disabled");
         }
 
-        String auronOperatorId = "FlinkAuronCalc-" + getId();
-        FlinkAuronCalcOperatorFactory factory = new FlinkAuronCalcOperatorFactory(
-                result.getPlan(), inputRowType, (RowType) getOutputType(), auronOperatorId);
+        FlinkAuronCalcOperator operator = new FlinkAuronCalcOperator(
+                plan.get(), inputRowType, outputRowType, "FlinkAuronCalc-" + getId());
 
         return ExecNodeUtil.createOneInputTransformation(
                 upstream,
                 createTransformationMeta(CALC_TRANSFORMATION, config),
-                factory,
-                InternalTypeInfo.of(getOutputType()),
+                operator,
+                InternalTypeInfo.of(outputRowType),
                 upstream.getParallelism(),
                 /*memoryBytes=*/ 0);
     }
 
-    private AuronCalcConversionResult tryConvert(
-            List<RexNode> projection, @Nullable RexNode condition,
-            RowType inputRowType, RowType outputRowType,
-            PlannerBase planner, ReadableConfig persistedConfig) {
+    /**
+     * Attempts to compose a native plan from this Calc's projection and condition.
+     * Returns empty if any RexNode is unsupported by the converter framework, or if
+     * plan composition throws.
+     */
+    private Optional<PhysicalPlanNode> tryBuildAuronPlan(
+            RowType inputRowType, RowType outputRowType) {
         try {
             ConverterContext ctx = new ConverterContext(
-                    persistedConfig,
+                    getPersistedConfig(),
                     AuronAdaptor.getInstance().getAuronConfiguration(),
                     Thread.currentThread().getContextClassLoader(),
                     inputRowType);
-            return RexProgramToPlanBuilder.build(projection, condition, inputRowType, outputRowType, ctx);
-        } catch (Throwable t) {
-            // Defensive: converter framework already catches per-RexNode failures, but
-            // schema conversion or plan composition could still throw.
-            LOG.debug("Auron Calc conversion failed for node {}", getId(), t);
-            return AuronCalcConversionResult.fallback("conversion threw " + t.getClass().getSimpleName());
-        }
-    }
-}
-```
+            FlinkNodeConverterFactory converters = FlinkNodeConverterFactory.getInstance();
 
-**Why `Throwable` in the outer catch**: defense-in-depth. The converter factory already catches `Exception` per #1859; this outer net handles `AssertionError` from Calcite (rare but observed) and `IllegalArgumentException` from `injectFfiReaderLeaf` (different code path, not a concern here, but cheap insurance). Fallback is the safe default for **any** failure.
-
-### File 2 — `RexProgramToPlanBuilder`
-
-```java
-// org.apache.auron.flink.table.planner.processor.RexProgramToPlanBuilder
-public final class RexProgramToPlanBuilder {
-    private RexProgramToPlanBuilder() {}
-
-    public static AuronCalcConversionResult build(
-            List<RexNode> projection,
-            @Nullable RexNode condition,
-            RowType inputRowType,
-            RowType outputRowType,
-            ConverterContext ctx) {
-
-        FlinkNodeConverterFactory factory = FlinkNodeConverterFactory.getInstance();
-
-        // 1. Convert filter condition (if present)
-        PhysicalExprNode filterExpr = null;
-        if (condition != null) {
-            Optional<PhysicalExprNode> converted = factory.convertRexNode(condition, ctx);
-            if (!converted.isPresent()) {
-                return AuronCalcConversionResult.fallback(
-                        "unsupported RexNode in condition: " + condition.getClass().getSimpleName());
+            // 1. Convert filter (if any)
+            PhysicalExprNode filterExpr = null;
+            if (condition != null) {
+                Optional<PhysicalExprNode> c = converters.convertRexNode(condition, ctx);
+                if (!c.isPresent()) {
+                    return Optional.empty();
+                }
+                filterExpr = c.get();
             }
-            filterExpr = converted.get();
-        }
 
-        // 2. Convert projection expressions (always non-empty for a real Calc)
-        List<PhysicalExprNode> projectExprs = new ArrayList<>(projection.size());
-        for (RexNode rex : projection) {
-            Optional<PhysicalExprNode> converted = factory.convertRexNode(rex, ctx);
-            if (!converted.isPresent()) {
-                return AuronCalcConversionResult.fallback(
-                        "unsupported RexNode in projection: " + rex.getClass().getSimpleName());
+            // 2. Convert projection
+            List<PhysicalExprNode> projectExprs = new ArrayList<>(projection.size());
+            for (RexNode rex : projection) {
+                Optional<PhysicalExprNode> c = converters.convertRexNode(rex, ctx);
+                if (!c.isPresent()) {
+                    return Optional.empty();
+                }
+                projectExprs.add(c.get());
             }
-            projectExprs.add(converted.get());
-        }
 
-        // 3. Build FFIReader leaf (placeholder resource ID; operator rewrites at open())
-        Schema inputSchema = SchemaConverters.convertToAuronSchema(inputRowType, false);
-        FFIReaderExecNode ffiReader = FFIReaderExecNode.newBuilder()
-                .setNumPartitions(1)               // each Flink subtask = 1 native partition (mirrors #1857)
-                .setSchema(inputSchema)
-                .setExportIterProviderResourceId(FlinkAuronCalcOperator.RESOURCE_ID_PLACEHOLDER)
-                .build();
-        PhysicalPlanNode current = PhysicalPlanNode.newBuilder()
-                .setFfiReader(ffiReader)
-                .build();
-
-        // 4. Optionally wrap with Filter
-        if (filterExpr != null) {
-            FilterExecNode filterNode = FilterExecNode.newBuilder()
-                    .setInput(current)
-                    .addExpr(filterExpr)
+            // 3. Compose: Project[Filter?[FFIReader-placeholder]]
+            FFIReaderExecNode ffiReader = FFIReaderExecNode.newBuilder()
+                    .setNumPartitions(1)
+                    .setSchema(SchemaConverters.convertToAuronSchema(inputRowType, false))
+                    .setExportIterProviderResourceId(
+                            FlinkAuronCalcOperator.RESOURCE_ID_PLACEHOLDER)
                     .build();
-            current = PhysicalPlanNode.newBuilder().setFilter(filterNode).build();
-        }
+            PhysicalPlanNode current = PhysicalPlanNode.newBuilder().setFfiReader(ffiReader).build();
 
-        // 5. Wrap with Projection (output names + types come from outputRowType)
-        ProjectionExecNode.Builder projBuilder = ProjectionExecNode.newBuilder().setInput(current);
-        for (int i = 0; i < projectExprs.size(); i++) {
-            projBuilder.addExpr(projectExprs.get(i));
-            projBuilder.addExprName(outputRowType.getFieldNames().get(i));
-            projBuilder.addDataType(SchemaConverters.convertToAuronArrowType(
-                    outputRowType.getTypeAt(i)));
-        }
-        PhysicalPlanNode finalPlan = PhysicalPlanNode.newBuilder()
-                .setProjection(projBuilder.build())
-                .build();
+            if (filterExpr != null) {
+                FilterExecNode filterNode = FilterExecNode.newBuilder()
+                        .setInput(current).addExpr(filterExpr).build();
+                current = PhysicalPlanNode.newBuilder().setFilter(filterNode).build();
+            }
 
-        return AuronCalcConversionResult.success(finalPlan);
+            ProjectionExecNode.Builder proj = ProjectionExecNode.newBuilder().setInput(current);
+            for (int i = 0; i < projectExprs.size(); i++) {
+                proj.addExpr(projectExprs.get(i));
+                proj.addExprName(outputRowType.getFieldNames().get(i));
+                proj.addDataType(SchemaConverters.convertToAuronArrowType(outputRowType.getTypeAt(i)));
+            }
+            return Optional.of(PhysicalPlanNode.newBuilder().setProjection(proj.build()).build());
+
+        } catch (Throwable t) {
+            // Defense-in-depth: converter framework catches Exception per #1859, but
+            // schema conversion or proto composition could still throw (e.g. unsupported
+            // LogicalType in SchemaConverters). Treat any failure as fallback.
+            LOG.debug("Auron Calc plan composition threw for node {}", getId(), t);
+            return Optional.empty();
+        }
     }
 }
 ```
 
-Plan-shape rule: **always emits `Project[Filter?[FFIReader]]`**. The `Project` is unconditional even when the projection is identity, because `FlinkAuronCalcOperator.injectFfiReaderLeaf` accepts `Project[FFIReader]` and `Project[Filter[FFIReader]]`; the bare-`FFIReader` and `Filter[FFIReader]` shapes from #1857's contract are not produced by a normal Flink Calc (Calc always has a projection). This keeps the rewriter's output deterministic.
+**Plan-shape rule**: always emits `Project[Filter?[FFIReader-placeholder]]`. The `Project` is unconditional even when the projection is identity, because `FlinkAuronCalcOperator.injectFfiReaderLeaf` accepts `Project[FFIReader]` and `Project[Filter[FFIReader]]`; the bare-`FFIReader` and `Filter[FFIReader]` shapes from #1857's contract aren't produced by a normal Flink Calc (Calc always has a projection).
 
-**Identity projection** — Flink may produce a Calc that re-emits all input columns unchanged. The Projection's expressions are `RexInputRef`s with the same indices, which #1859's `RexInputRefConverter` handles fine. No special case needed.
+**Identity projection** — Flink may produce a Calc that re-emits all input columns unchanged. The Projection's expressions are `RexInputRef`s with the same indices, which #1859's `RexInputRefConverter` handles. No special case needed.
 
-### File 3 — `FlinkAuronCalcOperatorFactory`
+**Why `Throwable` in the catch**: defense-in-depth. The converter framework catches per-RexNode `Exception` and returns `Optional.empty()`. The outer net handles `AssertionError` from Calcite (rare but observed) plus any `RuntimeException` from `SchemaConverters` on an unsupported `LogicalType`. Fallback is the safe default for **any** failure.
 
-```java
-// org.apache.auron.flink.table.planner.processor.FlinkAuronCalcOperatorFactory
-public class FlinkAuronCalcOperatorFactory
-        implements StreamOperatorFactory<RowData> {
+**Note on `FlinkAuronCalcOperator.RESOURCE_ID_PLACEHOLDER`**: this constant doesn't exist in #1857-merged code yet. Either add a 1-line `public static final String RESOURCE_ID_PLACEHOLDER = "placeholder"` to the operator class (reviewer OK?), or hardcode the literal `"placeholder"` here. `injectFfiReaderLeaf` doesn't validate the placeholder value, so either path works; the constant just keeps the contract co-located with the operator.
 
-    private static final long serialVersionUID = 1L;
-
-    private final byte[] planBytes;                  // proto-serialized PhysicalPlanNode
-    private final byte[] inputRowTypeBytes;          // Flink-serialized RowType (via DataTypes registry)
-    private final byte[] outputRowTypeBytes;
-    private final String auronOperatorId;
-    private ChainingStrategy chainingStrategy = ChainingStrategy.ALWAYS;
-
-    public FlinkAuronCalcOperatorFactory(
-            PhysicalPlanNode plan, RowType inputRowType, RowType outputRowType, String auronOperatorId) {
-        this.planBytes = plan.toByteArray();
-        this.inputRowTypeBytes = SerializerUtils.serialize(inputRowType);
-        this.outputRowTypeBytes = SerializerUtils.serialize(outputRowType);
-        this.auronOperatorId = auronOperatorId;
-    }
-
-    @Override
-    @SuppressWarnings("unchecked")
-    public <T extends StreamOperator<RowData>> T createStreamOperator(
-            StreamOperatorParameters<RowData> parameters) {
-        PhysicalPlanNode plan;
-        try {
-            plan = PhysicalPlanNode.parseFrom(planBytes);
-        } catch (InvalidProtocolBufferException e) {
-            throw new IllegalStateException("Failed to deserialize PhysicalPlanNode", e);
-        }
-        RowType inputRowType = SerializerUtils.deserialize(inputRowTypeBytes, RowType.class);
-        RowType outputRowType = SerializerUtils.deserialize(outputRowTypeBytes, RowType.class);
-
-        FlinkAuronCalcOperator op = new FlinkAuronCalcOperator(
-                plan, inputRowType, outputRowType, auronOperatorId);
-        op.setup(parameters.getContainingTask(), parameters.getStreamConfig(), parameters.getOutput());
-        return (T) op;
-    }
-
-    @Override
-    public void setChainingStrategy(ChainingStrategy strategy) { this.chainingStrategy = strategy; }
-
-    @Override
-    public ChainingStrategy getChainingStrategy() { return chainingStrategy; }
-
-    @Override
-    public Class<? extends StreamOperator> getStreamOperatorClass(ClassLoader classLoader) {
-        return FlinkAuronCalcOperator.class;
-    }
-}
-```
-
-**Why `byte[]` for RowType too**: `RowType` is `Serializable`, but Flink also provides a stable LogicalType-DataType conversion. We use the standard utility in `org.apache.flink.table.runtime.typeutils.InternalTypeInfo`. **Implementation phase**: verify whether `RowType` Java serialization is safe across cluster nodes; if not, fall back to `LogicalTypeSerializer.toString` + `parse`.
-
-**Note**: `FlinkAuronCalcOperator.RESOURCE_ID_PLACEHOLDER` does not exist yet in #1857. Either we add a public constant on the operator class (small one-line addition; needs reviewer OK) or we use the magic string `"placeholder"` (which `injectFfiReaderLeaf` already accepts since it doesn't validate the placeholder value — verify by re-reading #1857 source). **Design phase action**: confirm what placeholder string `FlinkAuronCalcOperator.open()`-side leaf rewrite expects.
-
-### File 4 — `AuronCalcConversionResult`
-
-```java
-// org.apache.auron.flink.table.planner.processor.AuronCalcConversionResult
-public final class AuronCalcConversionResult {
-    private final PhysicalPlanNode plan;     // null on fallback
-    private final String fallbackReason;     // null on success
-
-    private AuronCalcConversionResult(PhysicalPlanNode plan, String reason) {
-        this.plan = plan;
-        this.fallbackReason = reason;
-    }
-
-    public static AuronCalcConversionResult success(PhysicalPlanNode plan) {
-        return new AuronCalcConversionResult(plan, null);
-    }
-
-    public static AuronCalcConversionResult fallback(String reason) {
-        return new AuronCalcConversionResult(null, reason);
-    }
-
-    public boolean isSuccess() { return plan != null; }
-    public PhysicalPlanNode getPlan() { return Objects.requireNonNull(plan); }
-    public String getFallbackReason() { return Objects.requireNonNull(fallbackReason); }
-}
-```
-
-A 20-line value class. Could be replaced with `Optional<PhysicalPlanNode>` + logging at the call site, but the named "fallback reason" string is useful for log forensics (the user can grep `WARN` lines and learn exactly which RexNode killed the conversion).
-
-### File 5 — modify `FlinkNodeConverterFactory`
+### File 2 — modify `FlinkNodeConverterFactory`
 
 Add a static initializer that registers the three built-in converters once:
 
@@ -424,7 +332,7 @@ public class FlinkNodeConverterFactory {
 
 The constructor is package-private so tests can still create fresh instances; production code only reaches the singleton via `getInstance()`, which is now self-sufficient.
 
-### File 6 — extend `FlinkAuronConfiguration` with `FAIL_BACK_FLINK_ENGINE_ENABLED`
+### File 3 — extend `FlinkAuronConfiguration` with `FAIL_BACK_FLINK_ENGINE_ENABLED`
 
 A boolean config option that lets the user decide whether conversion failure should silently fall back to Flink's stock Calc or fail the job. Default `true` matches the issue text ("If unsupported, continue using FlinkCalc operators") — the user sees identical behavior to a non-Auron Flink cluster when a RexNode is missing converter coverage. Advanced users who want to surface missing-converter coverage at job-submission time can set it `false`. Lives in the existing `FlinkAuronConfiguration` (created by #1854):
 
@@ -458,50 +366,19 @@ The `FAIL_BACK_FLINK_ENGINE_ENABLED` contract:
 
 | `FAIL_BACK_FLINK_ENGINE_ENABLED` | Conversion result | Action in `translateToPlanInternal` |
 |---|---|---|
-| `true` (default) | success | Return Auron-backed `OneInputTransformation` |
-| `true` | failure (`AuronCalcConversionResult.fallback`) | Log `DEBUG`, return `super.translateToPlanInternal(planner, config)` (Flink's stock Calc) |
-| `true` | thrown exception (defensive `Throwable` catch) | Log `WARN` with the exception, return `super.translateToPlanInternal(...)` |
-| `false` | success | Return Auron-backed `OneInputTransformation` (unchanged) |
-| `false` | failure (`AuronCalcConversionResult.fallback`) | Throw `AuronCalcConversionException` carrying the fallback reason — fail fast, no silent silently-falling-back-to-Flink |
-| `false` | thrown exception | Re-throw as `AuronCalcConversionException` wrapping the cause |
+| `true` (default) | success (plan built) | Construct `FlinkAuronCalcOperator`, return Auron-backed `OneInputTransformation` |
+| `true` | failure (helper returned `Optional.empty()`) | Log `DEBUG`, return `super.translateToPlanInternal(planner, config)` (Flink's stock Calc) |
+| `true` | thrown exception (caught inside helper's outer `Throwable` net) | Helper returns `Optional.empty()`, then same fallback as above |
+| `false` | success | Construct `FlinkAuronCalcOperator`, return Auron-backed `OneInputTransformation` (unchanged) |
+| `false` | failure | Throw `IllegalStateException("Auron Calc conversion failed for node N and fallback is disabled")` — fail fast |
+| `false` | thrown exception (caught inside helper) | Same — helper returns `Optional.empty()` first, then throw `IllegalStateException` at the call site |
 
-The shadowed `StreamExecCalc.translateToPlanInternal` reads the option once at translation time:
-
-```java
-@Override
-protected Transformation<RowData> translateToPlanInternal(
-        PlannerBase planner, ExecNodeConfig config) {
-    Transformation<RowData> upstream = ...;
-    RowType inputRowType = ...;
-
-    boolean fallbackEnabled = AuronAdaptor.getInstance()
-            .getAuronConfiguration()
-            .get(FlinkAuronConfiguration.FAIL_BACK_FLINK_ENGINE_ENABLED);
-
-    AuronCalcConversionResult result = tryConvert(...);
-
-    if (!result.isSuccess()) {
-        if (fallbackEnabled) {
-            LOG.debug("Falling back to Flink's CodeGen Calc for node {}: {}",
-                    getId(), result.getFallbackReason());
-            return super.translateToPlanInternal(planner, config);
-        } else {
-            throw new AuronCalcConversionException(
-                    "Auron Calc conversion failed and fallback is disabled (node "
-                    + getId() + "): " + result.getFallbackReason());
-        }
-    }
-
-    // ... build Auron Transformation as before
-}
-```
-
-`AuronCalcConversionException extends RuntimeException` — new class in the processor package, single field (cause + message). Unchecked because Flink's `translateToPlanInternal` is not declared to throw checked exceptions.
+The shadowed `StreamExecCalc.translateToPlanInternal` reads the option only when conversion fails (success path doesn't pay for the lookup). Using stock `IllegalStateException` rather than a custom subclass — there's no caller that catches by type, and Flink's `translateToPlanInternal` doesn't declare any checked exception. See the code sketch in File 1 above.
 
 **Test additions** for this behavior:
-- `testFallbackEnabledTrueByDefault` (config-test, in `FlinkAuronConfigurationTest` if it exists, else new): verify default is `true`.
-- `testStreamExecCalcThrowsWhenFallbackDisabled` (in `StreamExecCalcTest`): set the config to `false`, give it an unsupported RexNode, assert the exception is thrown.
-- `testStreamExecCalcFallsBackWhenFallbackEnabled`: same setup, config `true`, assert `super.translateToPlanInternal` was invoked and a `CodeGenOperatorFactory` is the returned Transformation's factory.
+- `testFallbackEnabledTrueByDefault` (in `FlinkAuronConfigurationTest` if it already exists; else inline in `StreamExecCalcTest`): verify default is `true`.
+- `testStreamExecCalcThrowsWhenFallbackDisabled` (in `StreamExecCalcTest`): set the config to `false`, give it an unsupported RexNode, assert `IllegalStateException`.
+- `testStreamExecCalcFallsBackWhenFallbackEnabled`: same setup, config `true`, assert `super.translateToPlanInternal` was invoked (returned Transformation's operator is **not** `FlinkAuronCalcOperator`).
 
 ---
 
@@ -538,30 +415,28 @@ No POM edits required. No Rust changes. No proto changes (all three ExecNode mes
 
 ## Test Strategy
 
-Five test classes; tiered light-to-heavy.
+Two test classes; tiered light-to-heavy.
 
-### Unit tests (mock-heavy, fast)
+### Shadowed-class tests (planner-integrated)
 
-**`RexProgramToPlanBuilderTest`** — directly exercise the plan builder with hand-built `RexNode` trees.
-- `testProjectAndFilterEmitsProjectFilterFfiReader` — happy path, `condition != null`, simple projection.
-- `testProjectOnlyEmitsProjectFfiReader` — happy path, `condition == null`.
-- `testUnsupportedRexNodeInConditionReturnsFallback` — uses an unregistered RexNode subclass; asserts `isSuccess() == false`.
-- `testUnsupportedRexNodeInProjectionReturnsFallback` — same, in projection.
-- `testIdentityProjectionEmitsProject` — `RexInputRef`s only; asserts plan is still valid.
-- `testSchemaPropagatedFromOutputRowType` — verifies ProjectionExecNode's `expr_name` and `data_type` match the output RowType.
+**`StreamExecCalcTest`** (in `auron-flink-planner/src/test/java/org/apache/flink/table/planner/plan/nodes/exec/stream/` — same package as the class under test so `protected` field access works):
 
-**`FlinkAuronCalcOperatorFactoryTest`**:
-- `testSerializableRoundTrip` — serialize the factory, deserialize, compare plan bytes.
-- `testCreateStreamOperatorReturnsFlinkAuronCalcOperator` — mock `StreamOperatorParameters`, assert returned operator is non-null and the right type.
-- `testChainingStrategyDefaultsToAlways` — assert `getChainingStrategy() == ChainingStrategy.ALWAYS`.
+Plan-build paths (cover all branches of the inlined `tryBuildAuronPlan` helper):
+- `testProjectAndFilterEmitsAuronOperator` — happy path, `condition != null`, arithmetic projection. Assert returned Transformation's operator is `FlinkAuronCalcOperator`.
+- `testProjectOnlyEmitsAuronOperator` — happy path, `condition == null`.
+- `testIdentityProjectionEmitsAuronOperator` — `RexInputRef`s only.
+- `testSchemaPropagatedToProjectionExecNode` — assert the inlined plan's `ProjectionExecNode.expr_name` and `data_type` match the output RowType.
 
-### Shadowed-class tests (planner-integrated, medium)
+Fallback paths (default config `FAIL_BACK_FLINK_ENGINE_ENABLED=true`):
+- `testFallsBackWhenUnsupportedRexNodeInCondition` — inject an unregistered RexNode subclass in the condition; assert returned Transformation's operator is `CodeGenOperator` (or whatever Flink's default produces — assert it's NOT a `FlinkAuronCalcOperator`).
+- `testFallsBackWhenUnsupportedRexNodeInProjection` — same, in projection.
+- `testFallsBackWhenSchemaConversionThrows` — inject a `RowType` with an unsupported logical type (e.g. RAW); assert fallback occurs.
 
-**`StreamExecCalcTest`** (in `auron-flink-planner/src/test/java/org/apache/flink/table/planner/plan/nodes/exec/stream/`):
-- `testTranslateToPlanInternalUsesAuronFactoryWhenConvertible` — construct a `StreamExecCalc` with an arithmetic projection, mock the planner, assert the returned Transformation's factory is a `FlinkAuronCalcOperatorFactory`.
-- `testTranslateToPlanInternalFallsBackWhenUnsupportedRexNode` — construct with a `RexFieldAccess` (unregistered today), assert the returned Transformation's factory is `CodeGenOperatorFactory` (Flink's default).
-- `testTranslateToPlanInternalFallsBackWhenSchemaConversionThrows` — inject a `RowType` with an unsupported logical type (e.g. RAW), assert fallback.
-- `testShadowedClassReplacesFlinkClass` — load `StreamExecCalc.class` via `Class.forName`, assert its `getProtectionDomain().getCodeSource().getLocation()` points at `auron-flink-planner` (not `flink-table-planner`). Skipped if the test runs without the auron JAR on the classpath ahead of Flink's.
+Failure-disabled path:
+- `testThrowsWhenFallbackDisabled` — set `FAIL_BACK_FLINK_ENGINE_ENABLED=false` on the `AuronAdaptor`, inject an unsupported RexNode, assert `IllegalStateException` is thrown.
+
+Classpath verification:
+- `testShadowedClassReplacesFlinkClass` — load `StreamExecCalc.class` via `Class.forName`, assert its `getProtectionDomain().getCodeSource().getLocation()` points at `auron-flink-planner` (not `flink-table-planner`). Skipped if the test runs without the auron JAR ahead of Flink's on the classpath.
 
 ### End-to-end test (full SQL job)
 
@@ -601,9 +476,10 @@ Five test classes; tiered light-to-heavy.
 
 Approach B (PlannerFactory SPI + subclassed `StreamPlanner`) and Approach C (reflection into `getExecNodeGraphProcessors`) are both detailed under §"Approach Candidates" with the reasons for rejection.
 
-Two minor alternatives within the chosen approach:
-- **Option α.1**: extract `RexProgramToPlanBuilder.build` into the shadowed `StreamExecCalc` directly (no helper class). Rejected — separating it gives unit tests a clean entry point without instantiating a planner.
-- **Option α.2**: return `Optional<PhysicalPlanNode>` from the builder and pass a fallback reason via a separate channel. Rejected — `AuronCalcConversionResult` keeps reason + result paired in one place, simpler for log forensics.
+Within Approach A, Rev 1 originally proposed two helper classes (`RexProgramToPlanBuilder`, `AuronCalcConversionResult`) and a `StreamOperatorFactory` (`FlinkAuronCalcOperatorFactory`). Rev 2 removed all three:
+- Construct `FlinkAuronCalcOperator` inline (Flink wraps in `SimpleOperatorFactory` automatically; matches Gluten's pattern).
+- Inline plan-build inside the shadowed `StreamExecCalc.translateToPlanInternal` via a small private helper that returns `Optional<PhysicalPlanNode>`.
+- No bespoke sum type — `Optional<PhysicalPlanNode>` carries the success/failure signal; converter framework already logs the underlying reason at WARN level.
 
 ---
 
@@ -641,9 +517,9 @@ Out of scope: stateful operators (Agg, Join). These are separate tracks with the
 
 ## Open Items for Reviewer
 
-1. **Approach A vs. B**: This design picks A (shadow `StreamExecCalc` in Flink's package). Approach B (custom `PlannerFactory` SPI + subclassed `StreamPlanner`) is rejected because Flink 1.18 has no SPI registration for `ExecNodeGraphProcessor` (verified via `javap` against `flink-table-planner_2.12-1.18.1.jar`) and replacing the planner factory creates a `factoryIdentifier()` collision or forces user config. Reviewer concur?
-2. **`FAIL_BACK_FLINK_ENGINE_ENABLED` config option**: Boolean, default `true`. When `false`, conversion failure throws `AuronCalcConversionException`. Useful for advanced users who want to surface missing converter coverage at job submission. Reviewer OK with introducing this option?
-3. **`FlinkAuronCalcOperator.RESOURCE_ID_PLACEHOLDER` constant**: requires a 1-line addition to the #1857-merged operator class to expose a stable placeholder string the rewriter can pass in. Acceptable? Or hardcode the literal `"placeholder"` string at the rewriter site?
-4. **`FlinkNodeConverterFactory` static initializer**: minimal change to register the three built-in converters (#1859) on class load so production callers don't need to register them manually. Alternative is to have the shadowed `StreamExecCalc.translateToPlanInternal` register on first call (more defensive but uglier). Preference?
-5. **`AuronCalcConversionResult` sum type**: a 20-line value class with `success(plan)` and `fallback(reason)` constructors. Alternative is `Optional<PhysicalPlanNode>` + a logged WARN at the call site. The sum type keeps the fallback reason paired with the result for log forensics. Preference?
-6. **Test location for the shadowed class**: tests for `org.apache.flink.table.planner.plan.nodes.exec.stream.StreamExecCalc` must live in the same package (Java protected-access rules), even though it's the Auron module's test sources. OK with this packaging?
+Rev 2 closed items Q1 and Q2 from the prior review round. Remaining:
+
+1. **`FAIL_BACK_FLINK_ENGINE_ENABLED` config option**: Boolean, default `true`. When `false`, conversion failure throws `IllegalStateException` at translation time. Useful for advanced users who want to surface missing converter coverage at job submission. Reviewer OK with introducing this option?
+2. **`FlinkAuronCalcOperator.RESOURCE_ID_PLACEHOLDER` constant**: requires a 1-line addition to the #1857-merged operator class to expose a stable placeholder string the rewriter can pass in. Acceptable? Or hardcode the literal `"placeholder"` string at the rewriter site?
+3. **`FlinkNodeConverterFactory` static initializer**: minimal change to register the three built-in converters (#1859) on class load so production callers don't need to register them manually. Alternative is to have the shadowed `StreamExecCalc.translateToPlanInternal` register on first call (more defensive but uglier). Preference?
+4. **Test location for the shadowed class**: tests for `org.apache.flink.table.planner.plan.nodes.exec.stream.StreamExecCalc` must live in the same package (Java `protected` field access on `CommonExecCalc`), even though it's the Auron module's test sources. OK with this packaging?
