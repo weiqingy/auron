@@ -1,11 +1,30 @@
 # Design — AURON-1853: Convert Flink `StreamExecCalc` to Native Calc
 
 **Author**: weiqingy
-**Date**: 2026-05-19 (initial) — **Rev 2**: 2026-05-19 (simplified per reviewer feedback: drop factory + helper classes)
-**Status**: Rev 2 — pending reviewer feedback
+**Date**: 2026-05-19 (initial) — **Rev 2**: 2026-05-19 (simplified: drop factory + helper classes) — **Rev 3**: 2026-05-21 (log-based observability for fallback; global kill switch deferred)
+**Status**: **Approved 2026-05-21** by @Tartarus0zm — proceeding to SPEC + PLAN, then implementation
 **Issue**: https://github.com/apache/auron/issues/1853
 **Depends on**: #1856 (converter framework, merged), #1859 (RexNode converters, merged), #1857 (FlinkAuronCalcOperator, PR #2263 merged 2026-05-18)
 **Unblocks**: #1860, #1861, #1862, #1863, #1864, #1865
+
+---
+
+## Rev 3 Changes (2026-05-21)
+
+Two adjustments after a second review pass focused on user-visibility:
+
+**1. Log-based observability for fallback events**. Without notification, a user whose job hits a missing-converter case sees only "slow" execution — they can't tell Auron silently fell back. Flink `MetricGroup` counters would be ideal but conversion happens at JobManager planning time before any Auron operator (and its `MetricGroup`) exists, so logging is the natural channel. Adding two log behaviors, both always-on, both at planning time:
+
+- **WARN per fallback**: one line per unique unsupported `RexNode` class per job submission (deduplicated so a job with 50 identical Calcs doesn't spam). Includes the failing Calc's `ExecNode.getId()` and the `RexNode` class name. Lets a user grep for missing-converter coverage and file feature requests.
+- **INFO submission summary**: one line per job submission summarizing native-acceleration ratio: `Auron: 3 of 5 Calc operators native-accelerated; 2 fell back (unsupported: RexFieldAccess, RexOver)`. Tells the user at a glance how much of their job got accelerated.
+
+Both behaviors are independent of `FAIL_BACK_FLINK_ENGINE_ENABLED` (which controls hard-fail vs. fallback). Logs fire on every fallback in default-mode jobs. See updated §"Failure-handling behavior".
+
+**2. Global kill switch deferred to future work** (out of scope for #1853). Rationale: if a user doesn't have Auron in their deployment, they wouldn't place `auron-flink-planner` ahead of `flink-table-planner` on the classpath — the shadowing simply wouldn't activate. The "I have Auron deployed but want to disable it" use case is not a Calc-specific concern and can land in a separate PR if and when demand emerges.
+
+**3. Round-2 follow-ups confirmed** (no design change): `auron.failback.flink.engine.enabled` config option retained as the opt-in CI/dev strict-mode flag (Rev 2 design unchanged), placeholder resource ID hardcoded at the rewriter site, `FlinkNodeConverterFactory` static initializer for built-in converters, `StreamExecCalcTest` packaged at `org.apache.flink.table.planner.plan.nodes.exec.stream` in our test sources.
+
+**Net delta from Rev 2**: same file count and structure; ~10 lines of additional logging inside the shadowed `StreamExecCalc` and a small helper for the per-submission summary. No structural changes; no new dependencies.
 
 ---
 
@@ -367,7 +386,7 @@ The `FAIL_BACK_FLINK_ENGINE_ENABLED` contract:
 | `FAIL_BACK_FLINK_ENGINE_ENABLED` | Conversion result | Action in `translateToPlanInternal` |
 |---|---|---|
 | `true` (default) | success (plan built) | Construct `FlinkAuronCalcOperator`, return Auron-backed `OneInputTransformation` |
-| `true` | failure (helper returned `Optional.empty()`) | Log `DEBUG`, return `super.translateToPlanInternal(planner, config)` (Flink's stock Calc) |
+| `true` | failure (helper returned `Optional.empty()`) | **WARN log** (deduplicated per submission), return `super.translateToPlanInternal(planner, config)` (Flink's stock Calc) |
 | `true` | thrown exception (caught inside helper's outer `Throwable` net) | Helper returns `Optional.empty()`, then same fallback as above |
 | `false` | success | Construct `FlinkAuronCalcOperator`, return Auron-backed `OneInputTransformation` (unchanged) |
 | `false` | failure | Throw `IllegalStateException("Auron Calc conversion failed for node N and fallback is disabled")` — fail fast |
@@ -375,7 +394,32 @@ The `FAIL_BACK_FLINK_ENGINE_ENABLED` contract:
 
 The shadowed `StreamExecCalc.translateToPlanInternal` reads the option only when conversion fails (success path doesn't pay for the lookup). Using stock `IllegalStateException` rather than a custom subclass — there's no caller that catches by type, and Flink's `translateToPlanInternal` doesn't declare any checked exception. See the code sketch in File 1 above.
 
-**Test additions** for this behavior:
+### Observability (Rev 3)
+
+Without notification, a user whose job hits a missing-converter case sees only "slow" execution. Flink `MetricGroup` counters would be ideal but conversion happens at JobManager planning time before any Auron operator (and its `MetricGroup`) exists; logging is the natural channel.
+
+**Per-fallback WARN log** — emitted inside the shadowed `StreamExecCalc.translateToPlanInternal` when the helper returns `Optional.empty()` and `FAIL_BACK_FLINK_ENGINE_ENABLED=true`:
+
+```
+WARN Auron StreamExecCalc fallback (node 17): unsupported RexNode org.apache.calcite.rex.RexFieldAccess; using Flink CodeGen Calc.
+```
+
+**Deduplication**: only log the first occurrence of each unique `(unsupportedRexNodeClass)` tuple within a single job submission. Implementation: a planner-scoped `Set<Class<? extends RexNode>>` shared via a static `ThreadLocal` cleared at submission start; on each WARN, check-and-add. A job with 50 identical Calcs producing the same `RexFieldAccess` error logs only once.
+
+**Per-submission summary** — emitted once at the end of submission by the *first* Auron `StreamExecCalc` whose `translateToPlanInternal` runs, OR by a shutdown hook on the planner thread (TBD in implementation):
+
+```
+INFO Auron Flink Phase 1: 3 of 5 Calc operators native-accelerated; 2 fell back (unsupported RexNode classes: RexFieldAccess, RexOver).
+```
+
+The implementation will pick whichever hook is cleanest; the contract is that **at most one summary line per submission** appears, and only when at least one `StreamExecCalc` was processed.
+
+**Test additions** for the Rev 3 observability:
+- `testFallbackEmitsWarnLogOnce` (in `StreamExecCalcTest`): submit two `StreamExecCalc` instances with the same unsupported RexNode class, assert only one WARN line emitted (use a captured log appender).
+- `testFallbackEmitsDistinctWarnLogsForDistinctRexClasses` (in `StreamExecCalcTest`): submit two with different unsupported RexNode classes, assert two WARN lines emitted.
+- `testSubmissionSummaryLog` (E2E in `AuronCalcRewriteITCase`): submit a job mixing supported + unsupported Calcs, assert exactly one INFO summary line with the expected counts.
+
+**Test additions** for `FAIL_BACK_FLINK_ENGINE_ENABLED`:
 - `testFallbackEnabledTrueByDefault` (in `FlinkAuronConfigurationTest` if it already exists; else inline in `StreamExecCalcTest`): verify default is `true`.
 - `testStreamExecCalcThrowsWhenFallbackDisabled` (in `StreamExecCalcTest`): set the config to `false`, give it an unsupported RexNode, assert `IllegalStateException`.
 - `testStreamExecCalcFallsBackWhenFallbackEnabled`: same setup, config `true`, assert `super.translateToPlanInternal` was invoked (returned Transformation's operator is **not** `FlinkAuronCalcOperator`).
@@ -469,6 +513,8 @@ Classpath verification:
 | Substituting `StreamExecCalcBatch` (batch planner equivalent) | Future, if batch support is requested |
 | Cross-restart `auronOperatorId` stability test | CR4; documented limitation |
 | Substituting non-Calc operators (Aggregate, Join) | Beyond Phase 1 |
+| Global kill switch (`auron.flink.enabled` toggle to disable Auron without rebuilding) | Future PR. Rationale: a deployment without Auron simply wouldn't place `auron-flink-planner` ahead of `flink-table-planner` on the classpath; the shadow is inert. The "Auron deployed but disable temporarily" use case has no demonstrated demand yet and is not Calc-specific. |
+| Flink `MetricGroup` counters for native-acceleration ratio | Future PR. Requires a runtime hook (currently we only have planning-time visibility); could surface in Grafana/Prometheus once we have it. |
 
 ---
 
@@ -515,11 +561,23 @@ Out of scope: stateful operators (Agg, Join). These are separate tracks with the
 
 ---
 
-## Open Items for Reviewer
+## Resolved Items (review history)
 
-Rev 2 closed items Q1 and Q2 from the prior review round. Remaining:
+All review items from the prior rounds are now settled:
 
-1. **`FAIL_BACK_FLINK_ENGINE_ENABLED` config option**: Boolean, default `true`. When `false`, conversion failure throws `IllegalStateException` at translation time. Useful for advanced users who want to surface missing converter coverage at job submission. Reviewer OK with introducing this option?
-2. **`FlinkAuronCalcOperator.RESOURCE_ID_PLACEHOLDER` constant**: requires a 1-line addition to the #1857-merged operator class to expose a stable placeholder string the rewriter can pass in. Acceptable? Or hardcode the literal `"placeholder"` string at the rewriter site?
-3. **`FlinkNodeConverterFactory` static initializer**: minimal change to register the three built-in converters (#1859) on class load so production callers don't need to register them manually. Alternative is to have the shadowed `StreamExecCalc.translateToPlanInternal` register on first call (more defensive but uglier). Preference?
-4. **Test location for the shadowed class**: tests for `org.apache.flink.table.planner.plan.nodes.exec.stream.StreamExecCalc` must live in the same package (Java `protected` field access on `CommonExecCalc`), even though it's the Auron module's test sources. OK with this packaging?
+**Round 1** (Rev 2):
+- ✅ **Q1** — Dropped `FlinkAuronCalcOperatorFactory`. Operator constructed inline; Flink wraps in `SimpleOperatorFactory` automatically.
+- ✅ **Q2** — Dropped `RexProgramToPlanBuilder` and `AuronCalcConversionResult`. Plan-build inlined into shadowed `StreamExecCalc`; fallback signal is `Optional<PhysicalPlanNode>`.
+
+**Round 2** (Rev 3):
+- ✅ **Notification** — log-based observability added: per-fallback WARN (deduplicated) + per-submission INFO summary. Always-on, no user opt-in.
+- ✅ **Granularity** — confirmed per-Calc fallback is the right level. Per-operator-type config deferred to whichever sub-issue needs it.
+- ✅ **Global kill switch** — deferred to a future PR. A deployment without Auron simply wouldn't place `auron-flink-planner` ahead of `flink-table-planner` on the classpath, so the shadow is inert by default. Not a Calc-specific concern.
+
+**Round-2 follow-ups confirmed in Rev 3** (no design change from Rev 2):
+- ✅ `FAIL_BACK_FLINK_ENGINE_ENABLED` config option retained as the opt-in CI/dev strict-mode flag.
+- ✅ Placeholder resource ID hardcoded at the rewriter site (no `RESOURCE_ID_PLACEHOLDER` constant added to #1857).
+- ✅ Static initializer in `FlinkNodeConverterFactory` for built-in converters.
+- ✅ `StreamExecCalcTest` packaged at `org.apache.flink.table.planner.plan.nodes.exec.stream` in our test sources.
+
+**Status**: design approved 2026-05-21 by @Tartarus0zm. Proceeding to SPEC + PLAN, then implementation.
