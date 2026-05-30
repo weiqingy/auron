@@ -1,10 +1,10 @@
 # Investigation — AURON #2291: Shaded `auron-flink-planner` jar replacing the Flink planner
 
-## Rev 2 reconciliation (2026-05-29 — reviewer feedback)
+## Rev 2 reconciliation (2026-05-29)
 
-Reviewer (@Tartarus0zm) redirected the design to **reuse the existing `auron-flink-assembly`** (it already
-bundles runtime + Auron planner + Flink planner content and is used internally as one jar) instead of
-creating a new `auron-flink-planner-shaded` module. **Net effect on this investigation:**
+The design now **reuses the existing `auron-flink-assembly`** (it already bundles runtime + Auron planner +
+Flink planner content and is the single deployment jar) instead of creating a new `auron-flink-planner-shaded`
+module. **Net effect on this investigation:**
 - "Files to Create" — **drop** the new-module pom; the `<filters>` exclude, the net-new `META-INF/{NOTICE,
   LICENSE}`, and the structural IT all move **into `auron-flink-assembly`** (`src/main/resources` + `src/test`).
   The structural IT targets `target/auron-flink-assembly-*.jar`.

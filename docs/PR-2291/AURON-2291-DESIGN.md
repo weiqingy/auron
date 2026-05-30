@@ -1,34 +1,31 @@
 # Design — AURON #2291: Ship a shaded `auron-flink-planner` jar that replaces the Flink planner
 
 **Date**: 2026-05-29
-**Status**: Rev 2 — awaiting reviewer approval (Rev 2 adopts @Tartarus0zm's "reuse the assembly" feedback)
+**Status**: Rev 2 — awaiting reviewer approval (Rev 2 reuses the existing assembly jar instead of a new module)
 **Issue**: https://github.com/apache/auron/issues/2291 (follow-up to PR #2283 / #1853; sub-issue of #1264)
 **Source of truth**: `docs/PR-AURON-1853/AURON-1853-DESIGN.md` Rev 4 (deployment-model section) — the relevant
 parts are **inlined below** (§"Background — A1 vs A2, inlined from #2283 / Rev 4") so this document is
 self-contained; no need to open the #1853 doc.
 
-## Rev 2 Changes (2026-05-29 — reviewer feedback)
+## Rev 2 Changes (2026-05-29)
 
 Rev 1 proposed a **new `auron-flink-planner-shaded` module** producing a pure planner-replacement jar, plus
-**repurposing `auron-flink-assembly` into a runtime-only bundle** (two jars). Reviewer feedback (@Tartarus0zm)
-redirected this:
+**repurposing `auron-flink-assembly` into a runtime-only bundle** (two jars). Rev 2 simplifies this to
+**enhancing the existing `auron-flink-assembly` jar in place** (one jar, no new module), because that jar is
+already the single Flink deployment artifact.
 
-> *"Isn't the assembly module already meant for this? The assembly already has the runtime and planner
-> classes, plus the Flink planner classes — that's how we use it internally. Keep it simple, convenient for
-> users and for us to maintain."*
-
-**Verified against the repo — the reviewer is correct.** `auron-flink-assembly` shades `auron-flink-runtime`
-+ `auron-flink-planner` (`auron-flink-assembly/pom.xml:29-40`); `auron-flink-planner` depends on
-`flink-table-planner_2.12` at **compile scope** (`auron-flink-planner/pom.xml:130-134`); shade bundles
-transitive compile deps and the assembly's `artifactSet` excludes only hadoop/slf4j/flink-cep — **not**
-flink-table-planner. So the assembly jar **already bundles** Auron runtime + Auron planner + the full Flink
-planner content, and is already the single deployment artifact used internally.
+**Verified against the repo.** `auron-flink-assembly` shades `auron-flink-runtime` + `auron-flink-planner`
+(`auron-flink-assembly/pom.xml:29-40`); `auron-flink-planner` depends on `flink-table-planner_2.12` at
+**compile scope** (`auron-flink-planner/pom.xml:130-134`); shade bundles transitive compile deps and the
+assembly's `artifactSet` excludes only hadoop/slf4j/flink-cep — **not** flink-table-planner. So the assembly
+jar **already bundles** Auron runtime + Auron planner + the full Flink planner content, and is already the
+single deployment artifact.
 
 **Consequences for this design:**
 1. **No new module.** The shaded artifact is the existing `auron-flink-assembly` jar, enhanced in place.
-2. **One jar (Q2 resolved).** Runtime stays in the assembly jar alongside the planner — the reviewer's
-   established internal usage. Rev 1's D2-A (two jars) and D2-B (fold-runtime-into-a-new-module) are both
-   **dropped**; runtime placement is no longer an open question.
+2. **One jar (Q2 resolved).** Runtime stays in the assembly jar alongside the planner — its established
+   usage. Rev 1's D2-A (two jars) and D2-B (fold-runtime-into-a-new-module) are both **dropped**; runtime
+   placement is no longer an open question.
 3. **The latent bug this fixes (why #2291 is not a no-op).** Because the assembly already bundles *both*
    Auron's `StreamExecCalc` and Flink's stock `StreamExecCalc` (transitive) with **no `<filters>` exclude**,
    the surviving copy is decided by maven-shade's class-overlap ordering — **not contractually guaranteed.**
@@ -183,8 +180,8 @@ class-level filter today, so the survivor is whatever maven-shade writes last fo
 module.
 
 Rationale: per Rev 2, the assembly jar is already the single deployment artifact (runtime + Auron planner +
-Flink planner content) and is used that way internally; reusing it honors the reviewer's "keep it simple,
-convenient for users and maintenance" guidance and avoids module churn. The `<filters>` exclude converts the
+Flink planner content), so reusing it keeps the deployment simple for users and maintenance and avoids
+module churn. The `<filters>` exclude converts the
 jar's currently-incidental `StreamExecCalc` winner into a *structural* guarantee — exactly one
 `StreamExecCalc` (Auron's) — which is the substance of A2. The ASF NOTICE and a structural test certify that
 guarantee. Native binary, the EPL-licensed `jts-core`, and the runtime's `Factory` SPI already coexist in
@@ -297,8 +294,8 @@ No new external dependencies. `maven-shade-plugin` 3.5.2 (already in `pluginMana
 - **D1-a (rely on shade ordering)** — rejected (undocumented shade behavior; the incidental status quo this
   PR replaces).
 - **New `auron-flink-planner-shaded` module + two jars (Rev 1's D2-A)** — superseded by Rev 2. Added a module
-  and a second `lib/` jar for "planner-jar purity," but the assembly already bundles everything and is used
-  internally as one jar; the extra module/jar is churn the reviewer explicitly pushed back on.
+  and a second `lib/` jar for "planner-jar purity," but the assembly already bundles everything as one
+  deployment jar; the extra module and second jar are unnecessary churn.
 - **Fold runtime into a new shaded module (Rev 1's D2-B)** — same outcome as reusing the assembly but via a
   new module; reusing the existing assembly is strictly less churn.
 - **A1-explicit (Gluten's `config.sh` prepend)** — improves determinism without shading but still asks the
