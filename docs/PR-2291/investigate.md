@@ -1,5 +1,24 @@
 # Investigation — AURON #2291: Shaded `auron-flink-planner` jar replacing the Flink planner
 
+## Rev 2 reconciliation (2026-05-29 — reviewer feedback)
+
+Reviewer (@Tartarus0zm) redirected the design to **reuse the existing `auron-flink-assembly`** (it already
+bundles runtime + Auron planner + Flink planner content and is used internally as one jar) instead of
+creating a new `auron-flink-planner-shaded` module. **Net effect on this investigation:**
+- "Files to Create" — **drop** the new-module pom; the `<filters>` exclude, the net-new `META-INF/{NOTICE,
+  LICENSE}`, and the structural IT all move **into `auron-flink-assembly`** (`src/main/resources` + `src/test`).
+  The structural IT targets `target/auron-flink-assembly-*.jar`.
+- "Files to Modify" — **no `<modules>` change** and **no assembly deletion**; instead edit the assembly's
+  existing shade config (add the class-exclude filter + NOTICE/LICENSE transformers + failsafe wiring).
+- The "A2-replaces-A1 reference audit" (delete-assembly options) is **moot** — the assembly is kept and
+  enhanced, not retired. Its "never built in CI" finding still drives the CI change (build + `verify` it).
+- Q2 (runtime placement) is **resolved**: one jar (the assembly). The two-jar analysis below is superseded.
+
+Everything else (filter completeness, distinguishing signal, bundled-deps list, failsafe-in-`verify`, EPL
+`jts`) carries forward unchanged. See `AURON-2291-DESIGN.md` Rev 2 for the consolidated decision.
+
+---
+
 ## Files to Create
 
 | Path | Purpose | Key content notes |

@@ -1,5 +1,16 @@
 # Research — AURON #2291: Ship a shaded `auron-flink-planner` jar replacing the Flink planner
 
+## Rev 2 note (2026-05-29 — reviewer feedback)
+
+The reviewer confirmed `auron-flink-assembly` already bundles runtime + Auron planner + Flink planner content
+and is the internal deployment jar, so the design now **enhances that assembly jar in place** rather than
+adding a new module. None of the research *facts* below change — in particular, the assembly already
+contains both Auron's and stock `StreamExecCalc` (the duplicate the `<filters>` exclude resolves), and the
+loader-swap deployment finding still applies. Only the *packaging home* moved. See `AURON-2291-DESIGN.md`
+Rev 2.
+
+---
+
 ## ⚠️ Headline finding (changes the deployment procedure — needs reconciliation)
 
 Flink 1.18's **default distribution does NOT ship `flink-table-planner.jar` in `$FLINK_HOME/lib/`.**
