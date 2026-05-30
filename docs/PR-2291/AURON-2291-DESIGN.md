@@ -210,6 +210,32 @@ The module already declares `maven-shade-plugin` (`auron-flink-assembly/pom.xml:
   preserved by the current build (it is the established internal artifact), so no behavioral change is
   introduced to the runtime's table-factory wiring here.
 
+### Build time vs deploy time
+
+The collision and the filter are entirely a **build-time** concern (`mvn package`, where shade assembles the
+jar). At **deploy time** the jar is already built — the user just swaps it into `$FLINK_HOME/lib/`; nothing
+is merged or filtered then.
+
+### Build-time sequence (what `maven-shade-plugin` does, in order)
+
+```
+mvn package  (auron-flink-assembly)
+  1. Resolve dependencies to bundle:
+       - flink-table-planner_2.12   (stock StreamExecCalc + ~11,000 other planner/Calcite classes)
+       - auron-flink-planner        (Auron's StreamExecCalc override + converters)
+       - auron-flink-runtime        (operators, FFI, libauron.so)
+  2. Shade pours every class from every dependency into one output jar, one artifact at a time.
+  3. While pouring flink-table-planner_2.12 → the <filters> exclude fires here:
+       copy all of its classes EXCEPT StreamExecCalc.class (stock copy is skipped, never enters the jar).
+  4. While pouring auron-flink-planner → Auron's StreamExecCalc enters the jar (no filter on this artifact).
+  5. Shade writes auron-flink-assembly-<version>.jar → exactly ONE StreamExecCalc, and it is Auron's.
+```
+
+The jar *must* bundle flink-table-planner_2.12 because Auron overrides only `StreamExecCalc` and depends on
+the other ~11,000 planner classes; bundling it would otherwise drag in the stock `StreamExecCalc`, so the
+step-3 filter is what removes that one class and makes Auron's copy win by construction rather than by
+shade's (uncontracted) artifact-processing order.
+
 ### Licensing (ASF compliance) — net-new NOTICE/LICENSE in the assembly module
 
 - `src/main/resources/META-INF/NOTICE` (net-new): Auron header + a statement that the jar bundles a
