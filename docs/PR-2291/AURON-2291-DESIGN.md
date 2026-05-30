@@ -3,7 +3,9 @@
 **Date**: 2026-05-29
 **Status**: Rev 1 — awaiting reviewer approval
 **Issue**: https://github.com/apache/auron/issues/2291 (follow-up to PR #2283 / #1853; sub-issue of #1264)
-**Source of truth**: `docs/PR-AURON-1853/AURON-1853-DESIGN.md` Rev 4 (deployment-model section)
+**Source of truth**: `docs/PR-AURON-1853/AURON-1853-DESIGN.md` Rev 4 (deployment-model section) — the relevant
+parts are **inlined below** (§"Background — A1 vs A2, inlined from #2283 / Rev 4") so this document is
+self-contained; no need to open the #1853 doc.
 
 ## Problem Statement
 
@@ -14,6 +16,88 @@ Flink's planner and relies on classpath-traversal ordering to make Auron's class
 across JVM vendors or container rebuilds. AURON #2291 replaces that with **A2**: ship a shaded jar that
 *structurally* contains exactly one `StreamExecCalc` (Auron's), so activation no longer depends on ordering.
 The next ExecNode shadow PRs (#1860/#1861/#1864) should land on A2, not A1.
+
+## Background — A1 vs A2, inlined from #2283 / Rev 4
+
+> The following is reproduced from `AURON-1853-DESIGN.md` Rev 4 (the deployment-model discussion raised in
+> PR #2283 Round 2 review) so this design stands alone. It establishes the A1/A2 definitions, why a third
+> "just delete the planner jar" option doesn't work, the Spark-vs-Flink capability gap, and why A2 is the
+> agreed direction. **One correction applies** — Rev 4's "replace `flink-table-planner.jar`" wording is
+> superseded by the loader-swap procedure in the next section (Rev 5); everything else carries forward.
+
+### The shadowing mechanism (context)
+
+The architecture overrides Flink's built-in `StreamExecCalc` by shipping an Auron class with the same FQCN
+(`org.apache.flink.table.planner.plan.nodes.exec.stream.StreamExecCalc`). The JVM caches one class per FQCN,
+so whichever class loads first wins for the JVM's lifetime. #2283 specified the *mechanism* (the shadow
+class) but not the *deployment procedure* that guarantees Auron's class is the one loaded. A1 and A2 are the
+two procedures.
+
+### The two options
+
+- **A1 — JAR overlay (the current implementation being replaced).** The user drops Auron's jar into
+  `$FLINK_HOME/lib/` *alongside* Flink's planner. Both jars are present; the JVM resolves `StreamExecCalc`
+  to whichever appears first in its directory traversal of `lib/` — typically alphabetical, **but not
+  spec-guaranteed across JVM vendors**. If filesystem ordering changes (JVM vendor, container image rebuild,
+  launch-script classpath manipulation), Auron's class is silently no longer resolved — no error, no warning.
+- **A2 — shaded uber-jar replacement (this PR).** Auron ships a fat jar containing all of the planner's
+  content with Auron's `StreamExecCalc` (and future overrides) substituted in. The user swaps it into
+  `lib/`. **Only one `StreamExecCalc` exists on the classpath — Auron's — so activation is structural, not
+  ordering-dependent.**
+
+A natural-seeming third option — "tell users to remove the planner jar and keep only Auron's overlay jar" —
+**does not work without shading**: Auron's `StreamExecCalc` extends `CommonExecCalc` and transitively
+depends on other classes inside the planner jar; removing it `NoClassDefFoundError`s at class-load. To make
+"only Auron's jar in `lib/`" actually function, that jar must contain the planner content itself — which is
+exactly A2.
+
+### Why A2 (the two angles from Round 2 review)
+
+- **Robustness** — A1's classpath-ordering assumption is unenforced and can silently break. A2 eliminates it
+  structurally (there is no second `StreamExecCalc` to misorder against).
+- **Simplification** — the deployment story becomes a single deterministic jar swap rather than
+  overlay-plus-ordering.
+
+### Spark-vs-Flink capability gap (why this problem is Flink-only)
+
+Auron's Spark side has no such problem because Spark exposes a supported plan-rewrite SPI; Flink 1.18 does
+not. A true Spark-grade UX on Flink would require either upstreaming a Flink `ExecNode`-replacement SPI
+(verified absent across 1.18 / 1.20 / 2.0 / master — no FLIP in flight) or A2.
+
+| Dimension | Auron-Spark | Auron-Flink |
+|---|---|---|
+| Plan-rewrite hook | `SparkSessionExtensions.injectColumnar` (supported SPI) | None for `ExecNode` substitution on Flink 1.18 |
+| Activation mechanism | `spark.sql.extensions=…` in `spark-defaults.conf` | FQCN shadow of `StreamExecCalc` |
+| Classpath-order sensitivity | None (Spark reflects the named class) | **Yes (A1)** — first `StreamExecCalc` to load wins; **None (A2)** — structural |
+| Prior art | n/a | Gluten `gluten-flink/` ships 13 shadow `StreamExec*` classes — same mechanism as A1 |
+
+### Why not copy Gluten's exact procedure? (the A1-explicit fallback)
+
+Gluten's documented procedure ([`gluten-flink/docs/Flink.md`](https://github.com/apache/incubator-gluten/blob/main/gluten-flink/docs/Flink.md))
+does *not* drop jars in `lib/`. It places them in a dedicated `gluten_lib/` and edits `bin/config.sh` to
+**prepend** that dir to `FLINK_CLASSPATH`. Call this **A1-explicit** — more deterministic than A1 (the edit
+makes ordering an explicit operator action) but it still asks the user to reason about classpath ordering.
+
+| Approach | User steps | Activation determinism |
+|---|---|---|
+| **A1** (replaced) | 1 (drop jar in `lib/`) | Implicit — JVM directory traversal order |
+| **A1-explicit** (Gluten's) | 2 (place jars in a dir; edit `config.sh`) | Explicit — shell-script classpath prepend |
+| **A2** (this PR) | 1 (swap one jar in `lib/`) | Structural — only one `StreamExecCalc` class exists |
+
+A2 dominates A1-explicit on **both** user steps (1 vs 2 — and editing `config.sh` is fragile in
+containerized/managed Flink where it's regenerated or version-locked) **and** determinism (no later operator
+action can re-misorder the classpath, because there is no other jar to misorder against). A1-explicit
+remains a doc-only fallback if A2's scope (shading, artifact size, NOTICE) were judged unacceptable.
+
+### Why land A2 now (pre-GA timing)
+
+Auron's Flink support is pre-GA — no installed users — so A1→A2 is purely internal work, no migration cost.
+The future ExecNode shadows (#1860–#1865) ride the same deployment model: doing A2 upfront means each
+subsequent shadow lands against the clean model instead of being re-validated on an A2 cutover later. Costs
+are bounded — shade config is small, the ~30-52 MB artifact is normal (`flink-dist*.jar` is ~120 MB), and
+license handling is one-time work Apache projects do regularly (cf. `flink-shaded`, `spark-hadoop-cloud`).
+
+— end of inlined Rev 4 background —
 
 ## Key research finding that reshapes the deployment (DESIGN Rev 5 reconciliation)
 
