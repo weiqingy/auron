@@ -1,6 +1,6 @@
 # AURON #1860 — Convert Logical Operators to Auron Native Operators (Design)
 
-**Issue**: [#1860](https://github.com/apache/auron/issues/1860) · **Track**: Flink Phase 1 (AIP-1), Wave 1
+**Issue**: [#1860](https://github.com/apache/auron/issues/1860) · **Track**: Flink Phase 1 (AIP-1)
 **Status**: design for review (no code yet)
 
 ## Summary
@@ -99,5 +99,3 @@ Unit tests are added to the existing `RexCallConverterTest`, building each `RexC
 ## Risks
 
 - **CASE branch typing** — the one correctness-critical detail; covered by the mismatch test above.
-- **Merge conflicts with sibling Wave-1 PRs** (#1861, #1864) on the same supported-kind set / switch —
-  trivial line additions, resolved at rebase.
